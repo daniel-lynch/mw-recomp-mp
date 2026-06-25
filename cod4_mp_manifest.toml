@@ -1,0 +1,27 @@
+[project]
+sdk_version = "0.8.1.29"
+name = "cod4_mp"
+
+[entrypoint]
+file_path = "assets/default_mp.xex"
+out_directory_path = "generated"
+includes = [
+  "config/functions_mp.toml",
+]
+
+# iw3mp (default_mp.xex) — CoD4 MULTIPLAYER. DIFFERENT binary from iw3sp.
+# Constants (from generated/cod4_mp_init.h after first codegen, 2026-06-23):
+#   image_base 0x82000000  image_size 0x33D0000  code_base 0x820A0000
+#   code_size 0x2D64C4     entry/xstart 0x82103AC8   12,613 functions
+# (SP differs: code_base 0x82090000, entry 0x820E4600 — do NOT reuse SP addresses.)
+#
+# Wall 2 — IW3 per-frame setjmp trampoline, RE-DERIVED for the MP exe (2026-06-23).
+# Found statically: the ONLY `bnectr` in the MP binary, a 5-insn gate byte-identical to
+# SP's sub_820F0CC0 (lis r4,imm; lwz r0,off(r4); cmpwi r0,0; mtctr r0; bnectr) that loads
+# a .data handler ptr (NULL at boot) and calls it iff nonzero. NB: MP address != SP's.
+setjmp_address = 0x821217A0
+
+# Wall 5 — register-restoring longjmp (Com_Error unwind), RE-DERIVED for MP. Twin of SP's
+# sub_820EEEC0: lwz r3,308(r7); lwz r4,144(r7); bl <helper>; lfd f14,0(r7); ...f31; restores
+# r13-r31 + jumps to saved PC. Pairs with the setjmp above by jmp_buf addr at runtime.
+longjmp_address = 0x8211E680

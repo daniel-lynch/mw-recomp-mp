@@ -1,0 +1,10 @@
+# CoD4 (IW3 MP / iw3mp) default runtime config. Mirrors mw-recomp/config/cod4.default.toml.
+# CMake copies this to the build dir as `cod4_mp.toml` on first configure (does NOT overwrite).
+
+log_verbose = true
+
+# Synchronous shader compilation so first frames render reliably (slower first boot).
+async_shader_compilation = false
+
+# Required for guest frames to reach the swapchain. Turn OFF only for perf measurement.
+vulkan_readback_resolve = true

@@ -1,0 +1,39 @@
+# --- Build output ---
+/out/
+build/
+*.o
+*.a
+
+# --- Copyrighted game data (NEVER commit) ---
+# The original CoD4 multiplayer executable (default_mp.xex) and any extracted disc assets.
+/assets/
+
+# --- Recompiled, copyright-derived, regenerable code ---
+# `generated/` is PPC->C++ emitted by `rexglue codegen` from config/ + the xex.
+# Large (~50 MB), copyright-derived, reproducible. Re-run codegen after cloning before building.
+/generated/
+
+# --- Decrypted-xex working images (copyright-derived, large, regenerable) ---
+# Disassembly scratch produced from the xex; not a build input.
+tools/img.bin
+tools/mp_image.bin
+
+# --- External clone, not ours to vendor (Bot Warfare upstream) ---
+# Our adapted GSC is committed under gsc_inject/; this clone is only for its runtime waypoint CSVs.
+# Clone separately: git clone https://github.com/ineedbots/iw3_bot_warfare.git  (set COD4_WPDIR to it)
+/iw3_bot_warfare/
+
+# --- Graphify codebase-graph output (regenerable) ---
+/graphify-out/
+
+# --- Local runtime config written into the build dir at run time ---
+cod4_mp.toml
+/tmp/
+
+# --- Python / editor ---
+__pycache__/
+*.pyc
+*.swp
+
+# --- Local agent / editor settings ---
+/.claude/

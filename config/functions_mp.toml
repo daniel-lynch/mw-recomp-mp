@@ -1,0 +1,46 @@
+# Manual function hints for CoD4 MULTIPLAYER (iw3mp / default_mp.xex) codegen.
+# Mirrors mw-recomp/config/functions.toml (SP) but ALL ADDRESSES DIFFER — separate binary.
+# Populated as the MP wall sequence is worked:
+#   1. Unplaced branch targets (Validate-phase errors):  0xADDR = { name = "sub_ADDR" }
+#   2. Vtable/indirect-only methods (runtime [NULLCALL]): 0xADDR = { name = "sub_ADDR" }
+# Re-run `rexglue codegen cod4_mp_manifest.toml` after edits.
+
+[functions]
+# --- Class 1: unplaced branch targets (codegen Validate phase errors) ---
+#   b 0x820BDEF8 from 0x820DE94C - target not in any function
+0x820BDEF8 = { name = "sub_820BDEF8" }
+
+# --- Class 2: vtable-only / indirect-only methods (runtime InvalidFunctionTrap) ---
+# Found via tools/cod4_mp_nullcall.sh once guest code ran (after the OnLoadXexImage fix).
+#   indirect call from 0x820DC5BC (inside sub_820DC548), in sub_821A9E98 init phase.
+#   0x820C9478 is a standalone vtable-only adjustor thunk packed right after the tiny
+#   8-byte thunk sub_820C9470 (addi r3,r3,-4; b 0x820C5D40); analyzer never discovered it.
+0x820C9478 = { name = "sub_820C9478" }
+#   indirect call from 0x821B8624 (inside sub_821B8580), still in sub_821A9E98 init.
+#   0x820DC640 is a mid-function vtable target inside sub_820DC5F8 (which branches
+#   internally to loc_820DC61C and flows on) — declared as a CHUNK of the parent so its
+#   internal back-branches stay intra-function (the SP-proven fix for this case).
+0x820DC640 = { parent = 0x820DC5F8, name = "sub_820DC640" }
+#   indirect call from 0x82113C60 (inside sub_82113AB8), under sub_821A1270 init subtree.
+#   0x8210D9C0 lands mid-loop in sub_8210D938 (loc_8210D990..b 0x8210d980) — chunk of parent.
+0x8210D9C0 = { parent = 0x8210D938, name = "sub_8210D9C0" }
+
+#   MP map-load path (Split Screen Start Match), under sub_821A9E98->...->sub_82200598.
+#   0x8229CA60 mid sub_8229CA18 (single-flow body) -> chunk of parent.
+0x8229CA60 = { parent = 0x8229CA18, name = "sub_8229CA60" }
+
+# --- Manual switch-table overrides (rexglue auto-detection mis-fires) ---------
+# sub_8220A068 = the GSC/menu DFA lexer (MP twin of SP sub_821AE3D8; same 2645-line body).
+# Its final token-type dispatch bctr at 0x8220A2D0 is a jump table indexed by r10
+# (`cmplwi r10,98; rlwinm r0,r10,2; lwzx r0,r12,r0`), but rexglue's backward index-register
+# trace mis-identifies the index as r7 (the load reuses r0 as both dest and scaled index,
+# confusing the two backward traces in detectJumpTable) and emits `switch (r7)`. Wrong index
+# -> wrong token handler -> empty/-1 token -> GSC "script compile error: bad syntax", which
+# aborted Game Init (Split Screen Start Match), AND drove a degenerate (negative) length into
+# the token-text copy sub_82209F20 -> the "Awaiting challenge" infinite-loop hang. This single
+# override (correct register 10 + the 99 resolved targets) fixes BOTH: the local match then
+# loads to the CHOOSE TEAM screen. (Identical bug + fix as SP: mw-recomp/config/functions.toml.)
+[[switch_tables]]
+address = 0x8220A2D0
+register = 10
+labels = [0x8220A4E0, 0x8220A588, 0x8220A5A4, 0x8220A588, 0x8220A588, 0x8220A588, 0x8220A5C8, 0x8220A61C, 0x8220A658, 0x8220A694, 0x8220A6B8, 0x8220A6DC, 0x8220A700, 0x8220A724, 0x8220A748, 0x8220A76C, 0x8220A790, 0x8220A7B4, 0x8220A7D8, 0x8220A7FC, 0x8220A820, 0x8220A844, 0x8220A868, 0x8220A88C, 0x8220A8B0, 0x8220A8D4, 0x8220A8F8, 0x8220A91C, 0x8220A940, 0x8220A964, 0x8220A988, 0x8220A9AC, 0x8220A9D0, 0x8220A9F4, 0x8220AA18, 0x8220AA3C, 0x8220AA74, 0x8220AAAC, 0x8220AAD0, 0x8220AAF4, 0x8220AB18, 0x8220AB3C, 0x8220AB60, 0x8220AB84, 0x8220ABA8, 0x8220ABCC, 0x8220ABF0, 0x8220AC14, 0x8220AC38, 0x8220AC5C, 0x8220AC80, 0x8220ACA4, 0x8220ACC8, 0x8220ACEC, 0x8220AD10, 0x8220AD34, 0x8220AD58, 0x8220AD7C, 0x8220ADA0, 0x8220ADC4, 0x8220ADE8, 0x8220AE0C, 0x8220AE30, 0x8220AE54, 0x8220AE78, 0x8220AE9C, 0x8220AEC0, 0x8220AEE4, 0x8220AF08, 0x8220AF2C, 0x8220AF50, 0x8220AF74, 0x8220AF98, 0x8220AFBC, 0x8220AFE0, 0x8220B004, 0x8220B028, 0x8220B04C, 0x8220B070, 0x8220B094, 0x8220B0B8, 0x8220B0DC, 0x8220B100, 0x8220B124, 0x8220B148, 0x8220B16C, 0x8220B190, 0x8220B1B4, 0x8220B1D8, 0x8220B1FC, 0x8220B220, 0x8220B244, 0x8220B280, 0x8220B2BC, 0x8220A5E8, 0x8220A460, 0x8220B2F0, 0x8220B2F0, 0x8220B2F0]
