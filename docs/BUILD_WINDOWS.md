@@ -34,8 +34,18 @@ git clone git@github.com:daniel-lynch/mw-recomp-mp.git
 git clone https://github.com/ineedbots/iw3_bot_warfare.git   # Bot Warfare — for the waypoint data (runtime)
 ```
 
-The SDK must match the version this game targets — **`sdk_version = "0.8.1.29"`** (see
-`mw-recomp-mp/cod4_mp_manifest.toml`). If `main` has drifted, check out the tag/commit for 0.8.1.29.
+**Important — use the right SDK branch.** cod4_mp depends on SDK-side fakes (Xbox 360 System Link host-start
++ the Live backend) that live on branch **`testing/five-stability-fixes`** (commit `83af1d5` or later). A
+clean `main` / a plain `0.8.1.29` checkout does NOT have them, and System Link won't start (bots won't
+connect). Check it out:
+
+```powershell
+cd C:\dev\rexglue-sdk
+git checkout testing/five-stability-fixes      # has the CoD4 System Link + Live xam fakes (>= 83af1d5)
+```
+
+(The game records `sdk_version = "0.8.1.29"` in `cod4_mp_manifest.toml`; this branch is that line plus the
+cod4 xam fakes, and is the SDK the committed code was built against.)
 
 The **Bot Warfare** mod (`iw3_bot_warfare`) is an external clone (not vendored here). The bot GSC itself is
 already committed under `mw-recomp-mp/gsc_inject/` (our adapted copy); we only need the upstream clone for
