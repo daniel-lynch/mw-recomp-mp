@@ -3,8 +3,40 @@
 **Project:** `/home/dlynch/dev/mw-recomp-mp` (recompiled Xbox 360 CoD4 MP / iw3mp, on the prebuilt
 `rexglue-sdk`). **Date:** 2026-06-24.
 **End goal:** play CoD4 MP with a friend + bots (ideally smart "Bot Warfare"-style AI) and **rank up**,
-"like the old days." **Companion docs:** `mp-connect-bots-handoff.md` (deep RE history). **Memories:**
-`cod4-mp-startmatch-spin`, `cod4-mp-live-backend-fake`, `cod4-mp-bots-playing`.
+"like the old days." **Companion docs:** `mp-connect-bots-handoff.md` (deep RE history),
+`BUILD_WINDOWS.md` (build + test). **Memories:** `cod4-mp-botwarfare-gsc`, `cod4-mp-gsc-param-block`,
+`cod4-mp-bot-killcam-fix`, `cod4-mp-live-backend-fake`.
+
+---
+
+## ⚡ STATUS UPDATE (2026-06-25) — Phases 1 + 4 DONE; next = Phase 3
+
+The phase content below is from 2026-06-24 and is preserved as reference, but reality has moved well past
+its "start here / do last" sequencing:
+
+- **✅ Phase 1 (Bots that PLAY) — DONE, far beyond.** Bots team-join + spawn (the menuresponse path the doc
+  proposes), and now FULLY PLAY: navigate the map on real waypoints, sprint, crouch/prone/jump obstacles,
+  ADS, shoot, knife, kill, split across opposing teams with random class loadouts. **Full 6v6** (1 human +
+  11 bots) is stable (`COD4_MAXCLIENTS=12 COD4_BOTS=11 COD4_BOTSETTLE=240`).
+- **✅ Phase 4 (Smart bots / Bot Warfare) — DONE, out of order.** The full ~17k-line Bot Warfare GSC mod runs
+  on the recomp via disk-served GSC injection + custom native builtins (botmovement/botaction/botstop) and a
+  native usercmd AI layer. The complete `usercmd.buttons` map is RE'd + wired (fire 0x1 / sprint 0x2 / melee
+  0x4 / reload 0x10 / ADS 0x800 / prone 0x100 / crouch 0x200 / gostand-jump 0x400). See
+  `cod4-mp-botwarfare-gsc`, `cod4-mp-gsc-param-block`.
+- **✅ Bot "connection" polish — DONE.** Clean scoreboard ping + **working killcams** (the bot usercmd
+  serverTime was always 0 → frozen 0:00.0 cam; now stamped with the real server time). Default-on. See
+  `cod4-mp-bot-killcam-fix`.
+- **✅ Published.** Repo is public at github.com/daniel-lynch/mw-recomp-mp; SDK fakes on rexglue-sdk branch
+  `testing/five-stability-fixes` (>= 83af1d5). Windows test handoff = `docs/BUILD_WINDOWS.md`.
+
+**⭐ MVP** is ~90%: bots PLAY. The only missing MVP piece is **persistent bot NAMES/roster** (Phase 5 Layer
+B — external software, buildable anytime).
+
+**NEXT (decided):** **Phase 3 — Ranking / XP + custom classes** (see `phase3-ranking-handoff.md` for the
+implementation handoff). Rationale: lower-risk than Phase 2 netcode, self-contained, unlocks the greyed
+Create-a-Class, and a fully-featured single client is a better foundation for the eventual Phase 2
+friend-connect. Phase 2 (friend) follows, ideally opened with a feasibility spike (direct-IP vs System Link
+discovery; the `XNetXnAddrToInAddr` loopback blocker).
 
 ---
 
@@ -53,15 +85,27 @@ named roster has evolving ranks. Phase 4 (smart AI) and Phase 2 (friend) come af
   stats panel, Private Match) via a faked dead XStorage/LSP backend. `COD4_LIVE=1`. See
   `cod4-mp-live-backend-fake`. Create-a-Class is reachable but greyed (rank-gated → Phase 3).
 
-### Env flags (all default-off; the live/bot features are opt-in)
+### Env flags (bot/live features opt-in; the connection fixes are default-ON)
+**Bot Warfare 6v6 (the main feature):** `COD4_MAXCLIENTS=12 COD4_BOTS=11 COD4_BOTSETTLE=240 COD4_GSCINJECT=1
+COD4_BOTSPAWN=1 COD4_BOTAI=1` (+ `COD4_GSCDIR`/`COD4_WPDIR` if not on the dev box). See `BUILD_WINDOWS.md`.
+
 | Flag | Effect |
 |---|---|
-| `COD4_LIVE=1` | signin=2 + fake the dead Xbox Live backend (XStorage/LSP/XnAddr ONLINE). |
+| `COD4_GSCINJECT=1` | inject Bot Warfare GSC (disk-serve hook); serves `gsc_inject/` + waypoint CSVs. |
+| `COD4_BOTSPAWN=1` | force each bot's team + random class spawn (`mr 16` menuresponse injection). |
+| `COD4_BOTAI=1` | native usercmd AI: botmovement/botaction drive movement, aim, sprint/crouch/jump/ADS. |
+| `COD4_MAXCLIENTS=N` / `COD4_BOTS=N` | server size / BW bot fill count (12 / 11 = 6v6). |
+| `COD4_BOTSETTLE=F` | frames between bot spawns (240 needed at 11 bots; 150 crashes ~bot 4). |
+| `COD4_BOTCLASS=N` | force every bot onto `offline_classN_mp` (1–5) instead of random. |
+| `COD4_GSCDIR` / `COD4_WPDIR` | paths to the bot GSC / waypoint CSVs (default = dev box Linux paths). |
+| `COD4_BOTDUMP=1` | verbose per-bot logging (stance/speed/ADS/movement). |
+| `COD4_BOTPINGFIX_OFF` / `COD4_BOTCMDTIME_OFF` | disable the ping / killcam-timeline fixes (default ON). |
+| `COD4_LIVE=1` | signin=2 + fake the dead Xbox Live backend (XStorage/LSP/XnAddr ONLINE) → Live menus. |
 | `COD4_LIVE_TRACE=1` | stderr-log every XAM message dispatch (app/msg/buffer). |
-| `COD4_ADDBOTS=N` | add N `addtestclient` bots once cl0 is active; also bumps sv_maxclients to N+1. |
+| `COD4_ADDBOTS=N` | (legacy) add N `addtestclient` bots directly, no Bot Warfare. |
 | `COD4_CONSOLE=1` | re-enable the Com_Printf echo (off by default — silences LSP spam). |
-| `COD4_BOTLOG=1` | log every dvar name the GSC reads via `getdvarint`. |
 | `COD4_CMD="…"` / `COD4_CMD_DELAY=s` | inject a console command via Cbuf (sub_82238768). |
+| `COD4_BTNSWEEP` / `COD4_SPRINTSWEEP` / `COD4_ADSSWEEP` | diagnostic button-bit/playerState probes. |
 
 ### Build / run / drive (from repo root unless noted)
 ```
@@ -80,10 +124,14 @@ All game-side hooks live in `src/cod4mp_patches.cpp` (`[COD4MP-*]` tags); SDK fa
 
 ---
 
-## 2. PHASE 1 — Bots that PLAY (team-join + spawn)  ⟵ start here
+## 2. PHASE 1 — Bots that PLAY (team-join + spawn)  ✅ DONE (2026-06-25; see status banner)
 
 **State:** bots CONNECT (`addtestclient` handler `sub_82263110`, called by `[COD4MP-BOTS]`) but never
 pick a team, so they spectate.
+
+> ✅ **RESOLVED.** The menuresponse-injection path below is exactly what shipped (`[COD4MP-BOTSPAWN]`:
+> `mr 16 4 allies|axis` then `mr 16 13 offline_classN_mp,0` per bot via SV_ExecuteClientCommand
+> sub_82205CB8). Bots now fully play (Bot Warfare AI). Original analysis kept below for reference.
 
 **KEY FINDING (course-correction):** the handoff's "preferred path" (set `scr_testclients`=N so the
 stock GSC auto-spawns+joins) is **DEAD** — the gametype GSC in this build's fastfiles **never reads
@@ -171,13 +219,18 @@ are empty → **rank 1**, and Create-a-Class is greyed (rank-gated).
 
 ---
 
-## 5. PHASE 4 — Smart bots (Bot Warfare)  [stretch]
+## 5. PHASE 4 — Smart bots (Bot Warfare)  ✅ DONE (2026-06-25, out of order; see status banner)
 
 "Bot Warfare" is a GSC mod (PC CoD4). This recomp loads GSC from the game's fastfiles, so adding it means
 **injecting custom GSC** into the script VM — either rebuild/patch the `.ff` fastfiles to include the mod
 scripts, or hook the GSC script-loader to register extra scripts/threads. Research-heavy; do it only
 after Phase 1 (team-join) and ideally the netcode work, since it's the largest unknown. Stock bots
 (Phase 1) are the bridge until then.
+
+> ✅ **DONE via the loader-hook path** (no fastfile rebuild). Source-fetch hook `sub_8221EF90` disk-serves
+> the BW GSC from `gsc_inject/`; custom builtins via the compiler resolver `sub_82254D50` + AllocateThunk;
+> bootstrapped at onStartGameType. Native usercmd AI layer drives movement/aim/actions. Full writeup in
+> memory `cod4-mp-botwarfare-gsc` + `cod4-mp-gsc-param-block`.
 
 ---
 
