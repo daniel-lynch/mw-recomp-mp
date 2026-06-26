@@ -894,6 +894,18 @@ REX_FUNC(sub_821E6F90) {
                    len, (unsigned)buf);
       std::fflush(stderr);
     }
+    // Default the Find-Match cursor to the TOP playlist (1 = Team Deathmatch) instead of the
+    // profile-persisted index, so opening Find Match always starts at the top of the list. The `playlist`
+    // dvar (int, "The playlist number"; name string @0x82059508) holds the selected index — set its current
+    // value to 1 at playlist-parse time, before the menu reads it. The user can still select any other mode.
+    for (uint32_t ga = 0x84000000u; ga < 0x85400000u; ga += 4) {
+      if (rd32(base, ga) == 0x82059508u) {            // dvar_t.name == "playlist"
+        uint32_t one = __builtin_bswap32(1u);
+        std::memcpy(base + ga + 0xcu, &one, 4);       // current.integer = 1 (Team Deathmatch)
+        log_once("[COD4MP-PLAYLIST] defaulted Find-Match cursor to playlist 1 (Team Deathmatch)");
+        break;
+      }
+    }
   }
   __imp__sub_821E6F90(ctx, base);
 }
