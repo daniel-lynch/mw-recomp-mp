@@ -245,6 +245,56 @@ REX_FUNC(sub_821AC9A0) {
   __imp__sub_821AC9A0(ctx, base);
 }
 
+// [COD4MP-FFDUMP] Dump decompressed fastfile zones for offline analysis. The 360 .ff are SIGNED
+// (IWffs100) so an offline single zlib inflate breaks on the interleaved signature blocks; instead we
+// capture the output of the game's OWN zlib inflate body sub_8219F078(state=r3, z_stream=r4, flush=r5)
+// — z_stream: next_in@+0, avail_in@+4, next_out@+0xC, avail_out@+0x10. Append each call's produced
+// bytes (avail_out delta, at the pre-call next_out) to COD4_FFDUMP_FILE. At the main menu only the UI/
+// common zones load, so the dump stays small + greppable (menu/uiscript/dvar text is plain ASCII).
+// Activated ONLY when COD4_FFDUMP_FILE=<path> is set (keyed on the path, not a flag, so it can't be
+// accidentally left on). Found the "Server is full" root cause (ui_partyFull, below); kept as reusable
+// tooling. Extract individual assets from the dump offline with strings/grep (menu/uiscript text is ASCII).
+extern "C" void __imp__sub_8219F078(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_8219F078) {
+  static const char* dump_path = [] {
+    const char* p = std::getenv("COD4_FFDUMP_FILE");
+    return (p && p[0]) ? p : nullptr;
+  }();
+  if (!dump_path) { __imp__sub_8219F078(ctx, base); return; }
+  uint32_t strm = ctx.r4.u32;  // z_stream (next_out@+0xC, avail_out@+0x10)
+  uint32_t out_ptr = (strm > 0x10000u && strm < 0x90000000u) ? rd32(base, strm + 0xcu) : 0;
+  uint32_t avail_before = out_ptr ? rd32(base, strm + 0x10u) : 0;
+  __imp__sub_8219F078(ctx, base);
+  if (out_ptr > 0x10000u && out_ptr < 0xE0000000u) {  // zone output lands high (~0xA6xxxxxx)
+    uint32_t avail_after = rd32(base, strm + 0x10u);
+    if (avail_before >= avail_after) {
+      uint32_t produced = avail_before - avail_after;
+      if (produced > 0 && produced < 0x10000000u) {
+        static FILE* f = std::fopen(dump_path, "wb");
+        if (f) std::fwrite(base + out_ptr, 1, produced, f);
+      }
+    }
+  }
+}
+
+// [COD4MP-MMHOST] Suppress the spurious "Server is full" that aborts the Find-Match host launch. ROOT
+// CAUSE (found via the fastfile zone dump above + RE): the lobby menu shows the popup when the `ui_partyFull`
+// dvar is set, and sub_821E9E80 sets `ui_partyFull = (memberCount >= party_maxplayers)`, where the count
+// (sub_822B31B0) tallies party member slots @party+0x1200 (stride 0xC0) with state byte >= 3 — but the host
+// RESERVES all maxplayers(18) slots (state 3) when it hosts, so the count == 18 == max → spuriously "full"
+// with only 1 real player. sub_822B31B0 has ~42 callers (forcing it globally would break the party UI/logic),
+// so clamp it ONLY for the two calls inside the ui_partyFull check (return addresses 0x821E9F88 / 0x821E9FD0
+// in sub_821E9E80): force the returned count to 0 there so ui_partyFull evaluates (0 >= 18) == false. The
+// other 41 callers see the real count. Gated COD4_MMHOST.
+extern "C" void __imp__sub_822B31B0(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_822B31B0) {
+  uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_822B31B0(ctx, base);
+  if (env_on("COD4_MMHOST") && (lr == 0x821E9F88u || lr == 0x821E9FD0u)) {
+    ctx.r3.u32 = 0;  // ui_partyFull check sees count 0 -> party not "full" -> no spurious popup
+  }
+}
+
 // [COD4MP-VARPROBE] GSC script-variable pool usage probe (gated COD4_VARPROBE). The two allocators pop a
 // free list whose head index sits at pool_base+offset; the free list is built in-order at init, so the
 // MAX head index ever popped == the pool high-water mark (peak simultaneous usage). We track it per pool
