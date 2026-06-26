@@ -11,6 +11,41 @@ Project: `/home/dlynch/dev/mw-recomp-mp` (CoD4 MP / iw3mp recomp). SDK: `/home/d
 loads the installed `librexruntime.so`). Companion: `phase3-ranking-handoff.md` (profile/rank/playlist),
 memory `cod4-mp-playlist-matchmaking`, `cod4-mp-profile-system`.
 
+## ✅✅✅ 2026-06-26 — RESOLVED: FIND MATCH NOW SPAWNS INTO A LIVE MATCH WITH BOTS PLAYING
+The whole chain works end-to-end. Xbox LIVE → Find Match → playlist → the host now **connects to its own
+listen server, the map loads, and the player spawns into a real match with bots playing** (killcam read
+"Killed by bot6"; validated on **both mp_shipment and mp_backlot**). This **SUPERSEDES** the earlier
+"⛔ EXE-HOOK APPROACH EXHAUSTED / fastfile-script driven / pivot to System Link" conclusion below — that was
+only true *before* the SDK matchmaking fixes let server-spawn happen; once the server spawns the abort is a
+plain (deferred) `Com_Error` fully reachable from exe code.
+
+**ROOT CAUSE of "Server is full" (gdb HW-watchpoint on the deferred Com_Error chain + live shm poke):** after
+the match starts and the map loads, the host's OWN loopback connect to its freshly-started *online* listen
+server is rejected "EXE_SERVERISFULL" **every frame**, so the client retries forever ("Awaiting
+challenge...N" increments) and never spawns in. The reject is the online-direct-connect guard: it rejects
+while `onlinegame != 0` (=1 under COD4_LIVE; must stay 1 — drives stats/XP/unlocks) **AND** the session flag
+`sessionMgr+0xc` (sessionMgr = `*(0x84C209D0)`) is set. (NB: this is NOT in `SV_DirectConnect` sub_822044A0 —
+that fn is never called here; the guard reads the flag on a different connect path. The Com_Error trigger is
+`Com_Error(1,"%s","EXE_SERVERISFULL")` at guest `0x822ccc7c`.)
+
+**THE FIX (shipped, gated `COD4_MMHOST`, `src/cod4mp_patches.cpp`):** a **Com_Frame hook (`sub_822367B8`)**
+clears `sessionMgr+0xc` ONLY during the connect window — while cl0 connstate (`*(0x82435780)`) is `>0 && <9`
+(`9`=CA_ACTIVE; `0` at menu/lobby where the host still needs the flag to host). Live-proven STANDALONE (no
+gdb/poke): host + bots spawn in, per-frame rejects stop entirely.
+
+**RUN IT:** `COD4_LIVE=1 COD4_PLAYLIST=1 COD4_MMHOST=1 COD4_MAXCLIENTS=8 COD4_MM_SEARCH_DELAY_MS=6000
+COD4_GSCINJECT=1 COD4_BOTSPAWN=1 COD4_BOTAI=1` → Find Match → playlist → (poke `party_minplayers`=1) → spawn.
+Map override for the Live playlist: `COD4_PLAYLIST_FILE=<file>` with a `mp_backlot,war,1` entry.
+
+**⚠️ Use `COD4_MAXCLIENTS=8` (~7 bots) — STABLE on both maps.** `=12` (9 bots) exited mid-match: that's the
+known GSC var-pool / O(n²) name-grind bot-COUNT limit (memory `cod4-mp-bot-spawn-hang`/`cod4-mp-gsc-varlimit`),
+NOT a Shipment-waypoint issue (both maps have real BW waypoints: shipment 76 nodes, backlot 179).
+
+**Two cleanups still owed (unchanged):** (1) ship a `party_minplayers` lever to replace the poke; (2) make
+host-fallback fire without `COD4_MM_SEARCH_DELAY_MS`. Full RE detail in memory `cod4-mp-live-match-spawned`.
+gdb tips banked there: break on the `sub_XXXX` SYMBOL not the guest VA; `handle SIGSEGV nostop noprint pass`
+(runtime soft-MMU); needs `ptrace_scope=0`.
+
 ## 🎉🎉 2026-06-26 — FIND MATCH NOW HOSTS (reaches the pre-match host lobby!)
 `COD4_LIVE=1 COD4_PLAYLIST=1 COD4_MMHOST=1 COD4_MM_SEARCH_DELAY_MS=6000` → Find Match → select
 "Shipment 24/7" → the lobby **transitions from "Searching for available games" to "Waiting for 1 more

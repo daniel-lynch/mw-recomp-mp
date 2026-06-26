@@ -55,6 +55,14 @@ namespace {
   }
 }
 
+// Deferred bot spawn-command dispatch is ON BY DEFAULT (the validated fix for the multi-bot-spawn VM race);
+// only an explicit COD4_BOTQUEUE=0 disables it. Cached (read once).
+[[maybe_unused]] bool bot_queue_on() {
+  static int v = -1;
+  if (v < 0) { const char* e = std::getenv("COD4_BOTQUEUE"); v = (e && e[0] == '0') ? 0 : 1; }
+  return v != 0;
+}
+
 [[maybe_unused]] uint32_t rd32(uint8_t* base, uint32_t ga) {
   uint32_t v;
   std::memcpy(&v, base + ga, 4);
@@ -93,6 +101,25 @@ static void cod4_client_cmd(PPCContext& ctx, uint8_t* base, uint32_t num, const 
   __imp__sub_82205CB8(ctx, base);
   ctx = save;
 }
+
+// [COD4MP-BOTQUEUE] Deferred spawn-command dispatch (ON BY DEFAULT; COD4_BOTQUEUE=0 disables). The bot spawn fires its mr16
+// menuresponse via cod4_client_cmd -> SV_ExecuteClientCommand, which runs Bot Warfare's heavy onSpawned GSC.
+// Doing that from the mid-SV_Frame pump (sub_822CB3B0 @0x822366e0, right before the game frame) re-enters the
+// GSC VM while the frame is in flight -> probabilistic VM-state corruption = the multi-bot-spawn freeze/crash
+// (memory cod4-mp-bot-spawn-hang; the documented "core blocker"). Fix: the pump ENQUEUES the command and we
+// drain ONE per frame at SV_Frame EXIT (after __imp__sub_82236420 — the game frame for this tick has run, so
+// the VM is idle / all GSC threads drained), executing it top-level so it can't re-enter a live frame.
+struct PendingCmd { int num; char cmd[64]; };
+static PendingCmd g_cmdq[16];
+static std::atomic<int> g_cmdq_head{0}, g_cmdq_tail{0};
+static void cod4_enqueue_cmd(int num, const char* cmd) {
+  int t = g_cmdq_tail.load(std::memory_order_relaxed);
+  int nt = (t + 1) & 15;
+  if (nt == g_cmdq_head.load(std::memory_order_acquire)) return;   // full -> drop (the pump re-issues)
+  g_cmdq[t].num = num;
+  size_t i = 0; for (; cmd[i] && i < 63; i++) g_cmdq[t].cmd[i] = cmd[i]; g_cmdq[t].cmd[i] = 0;
+  g_cmdq_tail.store(nt, std::memory_order_release);
+}
 // Trigger for the bot add+join sequence: set to 0 when the HUMAN (cl0) joins (detected in the
 // SV_ExecuteClientCommand hook below — the connstate field 0x82435780 proved unreliable in-game),
 // then counted up per-frame here. -1 = human hasn't joined yet.
@@ -129,7 +156,8 @@ static void cod4_bot_spawn_pump(PPCContext& ctx, uint8_t* base) {
     if (sp_phase[i] == 0) {
       if (sp_frame < settle_until) break;            // previous bot still settling -> hold all new spawns
       const char* team = (i & 1) ? "mr 16 4 allies" : "mr 16 4 axis";  // alternate teams -> enemies to fight
-      cod4_client_cmd(ctx, base, (uint32_t)i, team);
+      if (bot_queue_on()) cod4_enqueue_cmd(i, team);          // run top-level at SV_Frame exit
+      else cod4_client_cmd(ctx, base, (uint32_t)i, team);
       sp_phase[i] = 1; sp_timer[i] = 0;
       std::fprintf(stderr, "[COD4MP-BOTSPAWN] cl#%d team (%s)\n", i, team + 6); std::fflush(stderr);
     } else if (sp_phase[i] == 1 && ++sp_timer[i] >= classdelay) {
@@ -141,7 +169,8 @@ static void cod4_bot_spawn_pump(PPCContext& ctx, uint8_t* base) {
       if (cls < 1 || cls > 5) cls = 1;
       char classcmd[48];
       std::snprintf(classcmd, sizeof(classcmd), "mr 16 13 offline_class%d_mp,0", cls);
-      cod4_client_cmd(ctx, base, (uint32_t)i, classcmd);
+      if (bot_queue_on()) cod4_enqueue_cmd(i, classcmd);      // run top-level at SV_Frame exit
+      else cod4_client_cmd(ctx, base, (uint32_t)i, classcmd);
       sp_phase[i] = 2; settle_until = sp_frame + settle;
       std::fprintf(stderr, "[COD4MP-BOTSPAWN] cl#%d class%d->spawn (next bot in %df)\n", i, cls, settle);
       std::fflush(stderr);
@@ -173,6 +202,22 @@ REX_FUNC(sub_822CB3B0) {
     std::fflush(stderr);
     for (int k = 1; k <= want; k++) cod4_client_cmd(ctx, base, (uint32_t)k, "mr 16 13 offline_class1_mp,0");
     phase = 3;
+  }
+}
+// [COD4MP-BOTQUEUE] SV_Frame (sub_82236420). Drain ONE queued bot spawn-command per frame at SV_Frame EXIT,
+// i.e. AFTER the game frame for this tick has run and the GSC VM has drained — a guaranteed top-level point
+// where executing the mr16 menuresponse can't re-enter a live frame's VM state. This is the deferred half of
+// the [COD4MP-BOTQUEUE] fix above (the pump enqueues mid-frame; we execute here). One per frame keeps it
+// serial and lets each bot's heavy onSpawned GSC fully drain before the next. On by default (COD4_BOTQUEUE=0 disables).
+extern "C" void __imp__sub_82236420(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_82236420) {
+  __imp__sub_82236420(ctx, base);
+  if (bot_queue_on()) {
+    int h = g_cmdq_head.load(std::memory_order_relaxed);
+    if (h != g_cmdq_tail.load(std::memory_order_acquire)) {
+      cod4_client_cmd(ctx, base, (uint32_t)g_cmdq[h].num, g_cmdq[h].cmd);
+      g_cmdq_head.store((h + 1) & 15, std::memory_order_release);
+    }
   }
 }
 // [COD4MP-FIX1] Start-Match hang guard (EXPERIMENT). The hang at "Awaiting challenge"
@@ -293,6 +338,73 @@ REX_FUNC(sub_822B31B0) {
   if (env_on("COD4_MMHOST") && (lr == 0x821E9F88u || lr == 0x821E9FD0u)) {
     ctx.r3.u32 = 0;  // ui_partyFull check sees count 0 -> party not "full" -> no spurious popup
   }
+}
+
+// [COD4MP-MMHOST] Online-direct-connect guard bypass — lets the host (and bots) actually JOIN the
+// Find-Match game. Once the party hosts (above) + the countdown fires, the match starts, the listen server
+// spawns and the map LOADS — but then the host's OWN loopback connect to its freshly-started online server
+// is rejected "EXE_SERVERISFULL" every frame, so the client retries forever ("Awaiting challenge...N"
+// increments) and never spawns in. ROOT CAUSE (gdb HW-watchpoint on the deferred Com_Error chain + live shm
+// poke, 2026-06-26, memory cod4-mp-live-match-spawned): the online-direct-connect guard rejects while the
+// session flag `sessionMgr+0xc` (sessionMgr = *(0x84C209D0)) is set AND `onlinegame != 0` — under COD4_LIVE
+// onlinegame=1 (must stay 1: it drives stats/XP/unlocks) and the flag is set, so the host's own connect
+// trips the guard meant to force matchmaking/invite joins over plain direct-connect. (Note: this is NOT in
+// SV_DirectConnect sub_822044A0 — that fn is never called here; the guard reads the flag elsewhere on the
+// connect path.) FIX, live-proven (host + bots then spawn into the Shipment match, the per-frame rejects
+// stop entirely): clear `sessionMgr+0xc` for the duration of the connect handshake only — i.e. while cl0's
+// connstate (*(0x82435780)) is mid-connect (>0 and <9=CA_ACTIVE; ==0 at menu/lobby where the host still
+// needs the flag to set up hosting, ==9 once joined). Done from Com_Frame (sub_822367B8, the main loop) so
+// it covers every connect retry with a tight, self-limiting window. Gated COD4_MMHOST.
+extern "C" void __imp__sub_822367B8(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_822367B8) {
+  if (env_on("COD4_MMHOST")) {
+    uint32_t cs = rd32(base, 0x82435780u);          // cl0 connstate
+    if (cs > 0u && cs < 9u) {                        // mid-connect (not menu/lobby, not yet active)
+      uint32_t sm = rd32(base, 0x84C209D0u);
+      if (sm >= 0x82000000u && sm < 0x86000000u && rd32(base, sm + 0xcu) != 0u) {
+        uint32_t zero = 0u;
+        std::memcpy(base + sm + 0xcu, &zero, 4);     // online guard now sees flag==0 -> host connect accepted
+        log_once("[COD4MP-MMHOST] connect-window: cleared session flag so host can join its own match");
+      }
+    }
+  }
+  __imp__sub_822367B8(ctx, base);
+}
+
+// [COD4MP-BOTNAMES] Give bots real-looking names instead of "botN". SV_AddTestClient (sub_82205A10) builds
+// each bot's connect string `connect "...\name\botN\xuid\...\protocol\..."` (the `bot%d` template @0x8206F058,
+// number from a counter @0x852EA810) and passes it to the connect-queue consumer sub_822380C8 (r3 = the
+// command string). We intercept that string and rewrite the `\name\` value from "botN" to a name off a
+// built-in roster, IN PLACE (the ~190-byte string sits in a 0x200 stack buffer, so a few extra chars fit),
+// so the new name flows naturally through userinfo -> client->name -> scoreboard/killcam with no offset RE.
+// Gated COD4_BOTNAMES so the default build is unaffected.
+extern "C" void __imp__sub_822380C8(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_822380C8) {
+  if (env_on("COD4_BOTNAMES")) {
+    uint32_t sga = ctx.r3.u32;
+    if (sga > 0x10000u && sga < 0xF0000000u) {
+      char* s = reinterpret_cast<char*>(base + sga);
+      if (std::strncmp(s, "connect \"", 9) == 0) {                 // only bot/loopback connect strings
+        char* np = std::strstr(s, "\\name\\");
+        if (np && std::strncmp(np + 6, "bot", 3) == 0) {           // default bot name -> rename it
+          static const char* kNames[] = {
+            "Soap", "Price", "Gaz", "Ghost", "Roach", "MacTavish", "Nikolai", "Kamarov",
+            "Griggs", "Vasquez", "Foley", "Dunn", "Ramirez", "Sandman", "Frost", "Wallcroft" };
+          static std::atomic<uint32_t> nameIdx{0};
+          const char* nm = kNames[nameIdx.fetch_add(1) % (sizeof(kNames) / sizeof(kNames[0]))];
+          char* vstart = np + 6;                                   // start of "botN"
+          char* vend = std::strchr(vstart, '\\');                  // backslash after the name value
+          size_t newlen = std::strlen(nm);
+          if (vend && newlen <= 16) {
+            std::memmove(vstart + newlen, vend, std::strlen(vend) + 1);  // shift suffix (incl NUL) to fit
+            std::memcpy(vstart, nm, newlen);
+            log_once("[COD4MP-BOTNAMES] renamed bot from botN to a roster name");
+          }
+        }
+      }
+    }
+  }
+  __imp__sub_822380C8(ctx, base);
 }
 
 // [COD4MP-VARPROBE] GSC script-variable pool usage probe (gated COD4_VARPROBE). The two allocators pop a
@@ -661,18 +773,111 @@ REX_FUNC(sub_82362DC8) {
 extern "C" void __imp__sub_821E6F90(PPCContext& ctx, uint8_t* base);
 REX_FUNC(sub_821E6F90) {
   if (env_on("COD4_PLAYLIST")) {
+    // Full Find-Match playlist: all stock game modes, then the "Shipment 24/7" special last (playlist 7). Define the
+    // gametypes (war/dm/dom/sab/sd/koth) once, then one playlist per mode with a stock-map rotation. Entry
+    // lines are COMMA-separated "<map>,<gametype>,<weight>" (weight>0). All maps used have BW waypoints so
+    // bots navigate; the GSC-inject bootstraps bots for whichever gametype loads. Iterate without rebuilding
+    // via COD4_PLAYLIST_FILE (below).
     static const char kPlaylist[] =
         "version 21\n"
         "gametype war\n"
         "\tname english \"Team Deathmatch\"\n"
         "\tscript war\n"
+        "gametype dm\n"
+        "\tname english \"Free For All\"\n"
+        "\tscript dm\n"
+        "gametype dom\n"
+        "\tname english \"Domination\"\n"
+        "\tscript dom\n"
+        "gametype sab\n"
+        "\tname english \"Sabotage\"\n"
+        "\tscript sab\n"
+        "gametype sd\n"
+        "\tname english \"Search and Destroy\"\n"
+        "\tscript sd\n"
+        "gametype koth\n"
+        "\tname english \"Headquarters\"\n"
+        "\tscript koth\n"
         "playlist 1\n"
+        "\tname english \"Team Deathmatch\"\n"
+        "\tdescription english \"Eliminate the enemy team.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,war,1\n"
+        "mp_crash,war,1\n"
+        "mp_crossfire,war,1\n"
+        "mp_citystreets,war,1\n"
+        "mp_overgrown,war,1\n"
+        "mp_strike,war,1\n"
+        "mp_vacant,war,1\n"
+        "mp_bog,war,1\n"
+        "playlist 2\n"
+        "\tname english \"Free For All\"\n"
+        "\tdescription english \"Every man for himself.\"\n"
+        "\tranked\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,dm,1\n"
+        "mp_crash,dm,1\n"
+        "mp_killhouse,dm,1\n"
+        "mp_shipment,dm,1\n"
+        "mp_vacant,dm,1\n"
+        "mp_bloc,dm,1\n"
+        "playlist 3\n"
+        "\tname english \"Domination\"\n"
+        "\tdescription english \"Capture and hold the objectives.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,dom,1\n"
+        "mp_crash,dom,1\n"
+        "mp_crossfire,dom,1\n"
+        "mp_citystreets,dom,1\n"
+        "mp_strike,dom,1\n"
+        "mp_overgrown,dom,1\n"
+        "playlist 4\n"
+        "\tname english \"Sabotage\"\n"
+        "\tdescription english \"Fight over a single bomb.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,sab,1\n"
+        "mp_crash,sab,1\n"
+        "mp_crossfire,sab,1\n"
+        "mp_strike,sab,1\n"
+        "mp_vacant,sab,1\n"
+        "mp_citystreets,sab,1\n"
+        "playlist 5\n"
+        "\tname english \"Search and Destroy\"\n"
+        "\tdescription english \"One life per round. Plant or defuse.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,sd,1\n"
+        "mp_crash,sd,1\n"
+        "mp_crossfire,sd,1\n"
+        "mp_strike,sd,1\n"
+        "mp_vacant,sd,1\n"
+        "mp_citystreets,sd,1\n"
+        "playlist 6\n"
+        "\tname english \"Headquarters\"\n"
+        "\tdescription english \"Capture and defend the HQ.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_backlot,koth,1\n"
+        "mp_crash,koth,1\n"
+        "mp_crossfire,koth,1\n"
+        "mp_citystreets,koth,1\n"
+        "mp_strike,koth,1\n"
+        "mp_overgrown,koth,1\n"
+        "playlist 7\n"
         "\tname english \"Shipment 24/7\"\n"
         "\tdescription english \"Nonstop close-quarters Team Deathmatch on Shipment.\"\n"
         "\tranked\n"
         "\tteambased\n"
         "\tmaxparty 12\n"
-        "mp_shipment,war,1\n";   // entry = <map>,<gametype>,<weight>  (COMMA-separated; weight>0)
+        "mp_shipment,war,1\n";
 
     // COD4_PLAYLIST_FILE lets us iterate the playlist text without rebuilding (fast format RE).
     static std::string fileBuf;
