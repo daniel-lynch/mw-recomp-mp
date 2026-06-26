@@ -399,3 +399,27 @@ XAM user/profile (signin, profile read/write + disk persistence), XStorage (down
 (XSession contexts/properties/create — stubs), XLiveBase (storage/stats/status msgs), LSP enumerate. Filling
 out XGI session-create + search + the XLiveBase status poll completes a minimal but real **offline Live /
 LAN-style matchmaking** that any recomp can reuse.
+
+### 🎯 2026-06-26 — ROOT CAUSE of "Server is full" FOUND + FIXED (via new fastfile tooling) — commit 3e3bd89
+The user said "get all the tooling we need." Built a **360 fastfile zone dumper** and it cracked the wall:
+- **Tooling:** `tools/ff_extract.py` + the `[COD4MP-FFDUMP]` hook on the game's zlib inflate body
+  (`sub_8219F078`; z_stream=r4, capture next_out@+0xC / avail_out@+0x10 deltas to `COD4_FFDUMP_FILE`). The
+  360 .ff are SIGNED (`IWffs100`) with signature blocks interleaved into the deflate stream, so an offline
+  single inflate breaks — dumping the game's OWN inflate output sidesteps it. The dumped zone's
+  menu/uiscript/dvar text is plain ASCII → greppable. (ui_mp zone ≈ 3.6MB; 145MB raw dump incl. window.)
+- **ROOT CAUSE:** the "Server is full" modal = the lobby menu reacting to the **`ui_partyFull` dvar**, set
+  by `sub_821E9E80` as `ui_partyFull = (memberCount >= party_maxplayers)`. The count `sub_822B31B0` tallies
+  party slots @party+0x1200 (stride 0xC0, state byte >= 3) — but the host RESERVES all maxplayers(18) slots
+  when it hosts, so count==18==max → spuriously "full" with 1 player. (This is why ALL 7 prior exe-hook
+  attempts + GSC probe hit dead paths: it's a dvar+menu interaction, not a connect reject or script.)
+- **FIX (`[COD4MP-MMHOST]`, gated, committed 3e3bd89):** hook `sub_822B31B0`, force its return to 0 ONLY for
+  the two calls inside the ui_partyFull check (lr == 0x821E9F88 / 0x821E9FD0) → ui_partyFull evaluates
+  (0>=18)==false. Other ~41 callers unaffected.
+
+⚠️ **UNVERIFIED in-game:** the host system disk hit **100% full** mid-session (`/` = sdb2, 2.4G free of 457G),
+which broke all test runs (game can't write logs/caches; harness produced empty/stale state). The fix is
+implemented + logically sound but NOT yet confirmed end-to-end. **NEXT: free disk space, then run
+`COD4_LIVE=1 COD4_PLAYLIST=1 COD4_MMHOST=1 COD4_MAXCLIENTS=12 COD4_MM_SEARCH_DELAY_MS=6000` + the
+party_minplayers=1 poke, and confirm the modal is gone and the match loads (mp_shipment) → then wire
+System-Link bots. If ui_partyFull suppression alone doesn't load the map, the deeper fix is the slot-
+reservation (host shouldn't reserve all maxplayers slots) — but that's the next lead, not a new wall.**
