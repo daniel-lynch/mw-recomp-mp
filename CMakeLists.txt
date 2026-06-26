@@ -18,6 +18,7 @@ include(generated/rexglue.cmake)
 set(COD4MP_SOURCES
     src/main.cpp
     src/cod4mp_patches.cpp
+    src/cod4mp_user_settings.cpp
 )
 
 if(WIN32)

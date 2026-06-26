@@ -10,7 +10,14 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+
+#include "cod4mp_user_settings.h"
 
 class Cod4MpApp : public rex::ReXApp {
  public:
@@ -45,6 +52,48 @@ class Cod4MpApp : public rex::ReXApp {
     if (paths.game_data_root.empty()) {
       paths.game_data_root = rex::filesystem::GetExecutableFolder() / "assets";
     }
+  }
+
+  // [COD4MP-PROFILE] Local-profile selection (modeled on the Skate 3 recomp). Runs after path
+  // defaults, before Runtime/UserProfile construction: load profiles.toml, ensure at least one
+  // usable profile, and apply the selected one to the SDK profile cvars (name/xuid/signin). The
+  // SDK keys its per-profile content dir on the profile name, so each profile keeps its own
+  // title-specific save blobs (rank/XP/unlocks/custom classes). On first run we persist a default
+  // "Player" profile so the file exists for editing. COD4_PROFILE selects a gamertag by env.
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults,
+      std::function<void(rex::PathConfig)> resume) override {
+    (void)resume;
+    auto profiles_path = cod4mp::ProfilesFilePath(defaults.user_data_root);
+    const bool had_file = std::filesystem::exists(profiles_path);
+
+    auto store = cod4mp::LoadProfiles(profiles_path);
+    const char* env_tag = std::getenv("COD4_PROFILE");
+    std::string default_tag = (env_tag && env_tag[0]) ? env_tag : "Player";
+    cod4mp::EnsureUsableProfileStore(store, default_tag);
+
+    // COD4_PROFILE also switches the active profile if one with that gamertag exists / create it.
+    if (env_tag && env_tag[0]) {
+      auto desired = cod4mp::MakeDefaultProfile(default_tag);
+      bool found = false;
+      for (const auto& p : store.profiles) {
+        if (p.id == desired.id) { found = true; break; }
+      }
+      if (!found) store.profiles.push_back(desired);
+      store.selected_profile = desired.id;
+    }
+
+    if (const auto* profile = cod4mp::FindSelectedProfile(store)) {
+      cod4mp::ApplyProfileCvars(*profile);
+      std::fprintf(stderr, "[COD4MP-PROFILE] active profile '%s' (id=%s xuid=%s) -> %s\n",
+                   profile->gamertag.c_str(), profile->id.c_str(),
+                   cod4mp::FormatXuid(profile->xuid).c_str(), profiles_path.string().c_str());
+      std::fflush(stderr);
+    }
+    if (!had_file) {
+      cod4mp::SaveProfiles(profiles_path, store);
+    }
+    return defaults;
   }
 
  private:

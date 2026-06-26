@@ -16,6 +16,7 @@
 
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/cvar.h>
 
 #include <atomic>
 #include <cmath>
@@ -24,6 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <set>
 #include <string>
 
@@ -222,6 +226,25 @@ REX_FUNC(sub_82234CB8) {
   __imp__sub_82234CB8(ctx, base);
 }
 
+// [COD4MP-MMHOST] Find-Match host-fallback. On the dead Xbox Live backend the matchmaking session search
+// returns 0 games, but the party never promotes itself to host, so the Find-Match lobby hangs forever on
+// "Searching for available games". RE (docs/research/matchmaking-mock360-handoff.md) pinned the host
+// decision to predicate sub_822B3658, evaluated once per completed search; its only failing gate is
+// sub_821AC9A0, which early-exits "no host" because the Live connection-state global [0x8239D098]==3 (plus
+// a session-capacity field [0x84C20FF4]==0 with no real online population). gdb confirmed: forcing this
+// gate to 1 makes the predicate reach host-promotion sub_822B90E8 (party_host->1). sub_821AC9A0 is called
+// ONLY by that predicate, so this is a precise, low-blast-radius lever that needs no poking of the two
+// fragile globals. Gated COD4_MMHOST so the default build / other modes are unaffected.
+extern "C" void __imp__sub_821AC9A0(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_821AC9A0) {
+  if (env_on("COD4_MMHOST")) {
+    log_once("[COD4MP-MMHOST] host-fallback: forcing gate sub_821AC9A0 -> 1 (party will host)");
+    ctx.r3.u32 = 1;
+    return;
+  }
+  __imp__sub_821AC9A0(ctx, base);
+}
+
 // [COD4MP-VARPROBE] GSC script-variable pool usage probe (gated COD4_VARPROBE). The two allocators pop a
 // free list whose head index sits at pool_base+offset; the free list is built in-order at init, so the
 // MAX head index ever popped == the pool high-water mark (peak simultaneous usage). We track it per pool
@@ -364,6 +387,260 @@ REX_FUNC(sub_821032F8) {
     return;
   }
   __imp__sub_821032F8(ctx, base);
+}
+
+// [COD4MP-UNLOCK] sub_821A2020(r3=controllerIndex, r4=pairIndex) reads a "pair stat" by index from
+// the name array @0x8239D000 = { "RANKXP", "PLEVEL" } (idx 0 = RANKXP, idx 1 = PLEVEL/prestige). It
+// resolves the name -> numeric stat id via the mp/playerStatsTable.csv lookup (sub_821D3C68 + atoi)
+// then reads the per-controller stat blob through the accessor sub_821A1CC8, returning the value in
+// r3. This is the NAME-CERTAIN rank reader used by the Barracks menu (file 11), the in-match
+// _rank.gsc, and the class UI — so it's the single clean lever for Phase 3 Path A (force-unlock):
+// on the dead Live backend the blob is all-zero -> RANKXP=0 -> rank 1 -> Create-a-Class greyed.
+// Under COD4_UNLOCK we override the return so rank/prestige read high and the class UI ungreys.
+// No magic numeric id and no CSV parsing needed — we key on the well-defined pair index. Default OFF
+// (the value is untouched), so the standard build is unchanged. COD4_STATPROBE just logs the pair.
+//   COD4_RANKXP  (default 2000000) = forced RANKXP value (well past max-rank XP -> rankTable clamps).
+//   COD4_PLEVEL  (default 10)       = forced prestige level.
+//
+// The displayed Barracks rank NUMBER does NOT flow through this pair-reader — it reads RANKXP via the
+// accessor sub_821A1CC8 DIRECTLY (the file-11 UI rank callers). So forcing here alone leaves rank=1.
+// The real chokepoint is the accessor: we self-LEARN the numeric RANKXP/PLEVEL stat ids (resolved from
+// mp/playerStatsTable.csv at runtime — no magic numbers) the first time the pair-reader resolves them,
+// by stashing the current pair index in g_pairCapture across the pair-reader's inner accessor call,
+// then force those ids at sub_821A1CC8 below. That covers BOTH the pair path and the direct UI rank.
+static std::atomic<int> g_rankxpId{-1};   // numeric statId for "RANKXP" (learned), -1 = unknown
+static std::atomic<int> g_plevelId{-1};   // numeric statId for "PLEVEL" (learned)
+static std::atomic<int> g_pairCapture{-1};// pair index currently being resolved inside sub_821A2020
+
+[[maybe_unused]] static int forcedRankxp() {
+  // Default must be a valid in-rankTable XP (near max rank). A value far past the table's top
+  // threshold makes rankForXp's binary search miss and report rank 0. 65540 ~ CoD4 MP max rank.
+  static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_RANKXP"); v = (s && s[0]) ? std::atoi(s) : 65540; } return v;
+}
+[[maybe_unused]] static int forcedPlevel() {
+  static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_PLEVEL"); v = (s && s[0]) ? std::atoi(s) : 10; } return v;
+}
+[[maybe_unused]] static int forcedRank() {
+  // 0-based rank index (byte stat 252); the menu displays it 1-based, so 54 -> "Lv 55" (Commander, max).
+  static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_RANK"); v = (s && s[0]) ? std::atoi(s) : 54; } return v;
+}
+
+// ---- [COD4MP-STATS] Path B: REAL persisted progression (rank + unlocks) ------------------------
+// The online-stats per-controller block (read via accessor sub_821A1CC8) holds rank/XP/unlocks/
+// challenge progress. ctrl 0 lives at guest 0x84C59D20, stride 16924: byte stats at +4+id (rank
+// LEVEL = id 252; validity flags 260/261/263), dword stats at +2004+(id-2000)*4 (RANKXP = id 2301).
+// The faked Live stats download leaves it all-zero. Instead of forcing the accessor RETURN per read
+// (COD4_UNLOCK — which the in-editor weapon-unlock checks bypass because they read the block direct),
+// here we WRITE real values into the block and PERSIST them to a per-profile file, so rank + unlocks
+// are real (visible everywhere) and survive across runs; any XP the game accrues in a match persists
+// too. Gated COD4_STATS; first run seeds when COD4_SEED is set. Per-profile path mirrors the SDK's
+// profile content dir (keyed on the user_profile_name cvar from our profile system).
+static constexpr uint32_t kStatBlock = 0x84C59D20u;
+static constexpr uint32_t kStatBlockSize = 16924u;
+
+[[maybe_unused]] static std::filesystem::path statsFilePath() {
+  if (const char* ov = std::getenv("COD4_STATS_FILE"); ov && ov[0]) return ov;
+  std::string name = rex::cvar::GetFlagByName("user_profile_name");
+  if (name.empty()) name = "User";
+  std::filesystem::path root;
+  if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0]) root = xdg;
+  else { const char* home = std::getenv("HOME"); root = std::filesystem::path(home ? home : ".") / ".local" / "share"; }
+  return root / "cod4_mp" / "415607E6" / "profile" / name / "stats.bin";
+}
+
+[[maybe_unused]] static void saveStatBlock(uint8_t* base) {
+  auto p = statsFilePath();
+  std::error_code ec; std::filesystem::create_directories(p.parent_path(), ec);
+  std::ofstream f(p, std::ios::binary | std::ios::trunc);
+  if (f) f.write(reinterpret_cast<const char*>(base + kStatBlock), kStatBlockSize);
+}
+
+// Seed the block: real rank + everything unlocked. Byte stats hold challenge/unlock progress, so a
+// high value unlocks rank-and-challenge-gated weapons/perks/attachments; rank byte + flags set last.
+[[maybe_unused]] static void seedStatBlock(uint8_t* base) {
+  uint8_t* blk = base + kStatBlock;
+  for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;       // unlock everything (challenge progress)
+  blk[4 + 252] = (uint8_t)forcedRank();                            // rank LEVEL
+  blk[4 + 260] = 1; blk[4 + 261] = 1; blk[4 + 263] = 1;           // rank validity flags
+  uint32_t be = __builtin_bswap32((uint32_t)forcedRankxp());      // RANKXP dword (guest big-endian)
+  std::memcpy(blk + 2004 + (2301 - 2000) * 4, &be, 4);
+}
+
+// Called from the accessor hook (a convenient per-frame-ish tick): load-or-seed once, then autosave.
+[[maybe_unused]] static void statsTick(uint8_t* base) {
+  if (!env_on("COD4_STATS")) return;
+  static bool loaded = false;
+  static std::time_t lastSave = 0;
+  if (!loaded) {
+    loaded = true;
+    auto p = statsFilePath();
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec) && std::filesystem::file_size(p, ec) == kStatBlockSize) {
+      std::ifstream f(p, std::ios::binary);
+      f.read(reinterpret_cast<char*>(base + kStatBlock), kStatBlockSize);
+      std::fprintf(stderr, "[COD4MP-STATS] loaded persisted stats <- %s\n", p.string().c_str());
+    } else if (env_on("COD4_SEED")) {
+      seedStatBlock(base);
+      saveStatBlock(base);
+      std::fprintf(stderr, "[COD4MP-STATS] seeded + saved new stats -> %s\n", p.string().c_str());
+    }
+    std::fflush(stderr);
+    lastSave = std::time(nullptr);
+    return;
+  }
+  std::time_t now = std::time(nullptr);
+  if (now - lastSave >= 30) { lastSave = now; saveStatBlock(base); }  // autosave accrued progress
+}
+
+extern "C" void __imp__sub_821A2020(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_821A2020) {
+  uint32_t idx = ctx.r4.u32;            // 0 = RANKXP, 1 = PLEVEL (array @0x8239D000)
+  int prev = g_pairCapture.exchange((int)idx);  // let the accessor hook learn the numeric id
+  __imp__sub_821A2020(ctx, base);       // r3 = real stat value (inner call resolves the id)
+  g_pairCapture.store(prev);
+  if (env_on("COD4_UNLOCK")) {
+    if (idx == 0)      { ctx.r3.u32 = (uint32_t)forcedRankxp(); log_once("[COD4MP-UNLOCK] RANKXP forced high (rank/classes unlock)"); }
+    else if (idx == 1) { ctx.r3.u32 = (uint32_t)forcedPlevel(); }
+  }
+  if (env_on("COD4_STATPROBE")) {
+    std::fprintf(stderr, "[COD4MP-STATPROBE] pair idx=%u (%s) -> value=%u\n",
+                 (unsigned)idx, idx == 0 ? "RANKXP" : idx == 1 ? "PLEVEL" : "?", (unsigned)ctx.r3.u32);
+    std::fflush(stderr);
+  }
+}
+
+// [COD4MP-UNLOCK] sub_821A1CC8(r3=controllerIndex, r4=statId) is the per-controller stat-blob ACCESSOR
+// — the universal chokepoint every stat read funnels through (byte stats statId<2000, dword stats
+// 2000<=statId<3498). It's how the Barracks rank number and _rank.gsc actually read RANKXP. We learn
+// the RANKXP/PLEVEL numeric ids from the pair-reader (g_pairCapture) and, under COD4_UNLOCK, override
+// the return for exactly those two ids so rank/prestige read high everywhere. Other stats untouched.
+// COD4_STATPROBE logs each distinct (id -> value, caller) once for RE. Default OFF -> value untouched.
+extern "C" void __imp__sub_821A1CC8(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_821A1CC8) {
+  statsTick(base);                      // [COD4MP-STATS] load-or-seed-once + autosave persisted stats
+  uint32_t id = ctx.r4.u32;
+  int pc = g_pairCapture.load(std::memory_order_relaxed);
+  if (pc == 0 && g_rankxpId.load(std::memory_order_relaxed) < 0) {
+    g_rankxpId.store((int)id);
+    if (env_on("COD4_STATPROBE")) { std::fprintf(stderr, "[COD4MP-STATPROBE] LEARNED RANKXP statId=%u\n", (unsigned)id); std::fflush(stderr); }
+  }
+  if (pc == 1 && g_plevelId.load(std::memory_order_relaxed) < 0) {
+    g_plevelId.store((int)id);
+    if (env_on("COD4_STATPROBE")) { std::fprintf(stderr, "[COD4MP-STATPROBE] LEARNED PLEVEL statId=%u\n", (unsigned)id); std::fflush(stderr); }
+  }
+  __imp__sub_821A1CC8(ctx, base);       // r3 = real stat value
+  if (env_on("COD4_FORCEALL")) {        // DIAGNOSTIC: force stat reads in [LO,HI) to a distinctive value
+    static int v = -1, lo = -2, hi = -2;
+    if (v < 0)   { const char* s = std::getenv("COD4_FORCEALL_VAL"); v  = (s && s[0]) ? std::atoi(s) : 7; }
+    if (lo < -1) { const char* s = std::getenv("COD4_FORCE_LO");     lo = (s && s[0]) ? std::atoi(s) : 0; }
+    if (hi < -1) { const char* s = std::getenv("COD4_FORCE_HI");     hi = (s && s[0]) ? std::atoi(s) : 100000; }
+    if ((int)id >= lo && (int)id < hi) ctx.r3.u32 = (uint32_t)v;
+  } else if (env_on("COD4_UNLOCK")) {
+    int rid = g_rankxpId.load(std::memory_order_relaxed);
+    int pid = g_plevelId.load(std::memory_order_relaxed);
+    // THE menu rank lever (found by bisecting COD4_FORCEALL over the byte-stat range): the displayed
+    // rank LEVEL and the rank-gated greying (Challenges / Clan Tag / Create-a-Class) are driven by
+    // byte stat 252 (= rank level) plus validity flags 260/261/263 — all must be set together, else
+    // the panel falls back to Lv 1 and the gates stay locked. Forcing 252 -> COD4_RANK and the flags
+    // -> 1 shows the real rank and ungreys the rank-gated UI. (This is the offline-stats force; real
+    // persistence would populate the XLiveBase stats download blob 0x00050009.)
+    if (id == 252) { ctx.r3.u32 = (uint32_t)forcedRank(); log_once("[COD4MP-UNLOCK] rank byte (252) forced -> COD4_RANK"); }
+    else if (id == 260 || id == 261 || id == 263) { ctx.r3.u32 = 1; }
+    else if (rid >= 0 && (int)id == rid) { ctx.r3.u32 = (uint32_t)forcedRankxp(); log_once("[COD4MP-UNLOCK] accessor RANKXP forced high"); }
+    else if (pid >= 0 && (int)id == pid) { ctx.r3.u32 = (uint32_t)forcedPlevel(); }
+  }
+  if (env_on("COD4_STATPROBE") && id < 4096) {
+    static bool seen[4096] = {false};
+    if (!seen[id]) { seen[id] = true;
+      std::fprintf(stderr, "[COD4MP-STATPROBE] accessor statId=%u -> value=%u (lr=%08X)\n",
+                   (unsigned)id, (unsigned)ctx.r3.u32, (uint32_t)ctx.lr);
+      std::fflush(stderr);
+    }
+  }
+}
+
+// [COD4MP-UNLOCK] sub_821E6848(r4=clientIndex) returns the player's RANKXP that feeds rankForXp
+// (sub_82362DC8) on the PLAYERCARD path (sub_821EAE28). In the menus the "stats valid" flag
+// @0x85022E6E is 0, so it returns 0x7FFFFFFF (INT_MAX). Under COD4_UNLOCK force the return to
+// COD4_RANKXP (valid in-table XP, default 65540). NOTE: this getter is NOT called for the Barracks
+// summary panel or the rank-gated greying (0 calls observed there), so forcing it does not by itself
+// ungrey Create-a-Class — kept for the playercard path / future use. See the rankForXp note above.
+extern "C" void __imp__sub_821E6848(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_821E6848) {
+  __imp__sub_821E6848(ctx, base);
+  if (env_on("COD4_UNLOCK")) {
+    ctx.r3.u32 = (uint32_t)forcedRankxp();
+    log_once("[COD4MP-UNLOCK] rank-xp getter forced high (rank level)");
+  }
+}
+
+// [COD4MP-UNLOCK] sub_82362DC8(r3=xp) = rankForXp: binary-searches mp/rankTable.csv and returns the
+// rank LEVEL for an XP value. COD4_STATPROBE logs the (xp -> rank) mapping; COD4_UNLOCK forces the
+// OUTPUT to COD4_RANK (default 55). *** EMPIRICAL FINDING (2026-06-25): forcing this does NOT move the
+// Barracks rank number NOR ungrey the rank-gated items ("Unlocked at Lance Corporal [Lv 5]" etc.).
+// STATPROBE shows the menu feeds rankForXp xp=0 here and the displayed rank stays Lv 1 even with the
+// output pinned to 30/55. So the menu's RANK LEVEL is NOT computed from the stat blob via this path —
+// it comes from a separate source (the per-client game struct is INT_MAX in menus; leading hypothesis
+// is the Xbox profile-settings title blob, faked empty -> rank 1). Kept as instrumentation; the real
+// menu-rank lever is still TODO. See docs/research/phase3-ranking-handoff.md. Default OFF -> untouched.
+extern "C" void __imp__sub_82362DC8(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_82362DC8) {
+  uint32_t xp = ctx.r3.u32;
+  __imp__sub_82362DC8(ctx, base);
+  if (env_on("COD4_STATPROBE")) {
+    std::fprintf(stderr, "[COD4MP-STATPROBE] rankForXp(xp=%u) -> rank=%d\n", (unsigned)xp, (int)ctx.r3.u32);
+    std::fflush(stderr);
+  }
+  if (env_on("COD4_UNLOCK")) {
+    static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_RANK"); v = (s && s[0]) ? std::atoi(s) : 55; }
+    ctx.r3.u32 = (uint32_t)v;
+    log_once("[COD4MP-UNLOCK] rankForXp forced -> max rank");
+  }
+}
+
+// [COD4MP-PLAYLIST] sub_821E6F90 = the playlist-text parser. CoD4's Find Match reads its gamemodes
+// from a playlist defined in TEXT (downloaded from the dead Live backend, so empty -> Find Match shows
+// nothing). The parser reads the text from the fixed buffer @0x84C495F8 (= r3 on entry). We inject a
+// generated playlist there so Find Match is populated. Grammar (from the parser's own keyword strings):
+//   version <N>
+//   gametype <type>            (type from {dm war tdm dom sd sab ctf koth}); name english "<label>"; script <name>
+//   playlist <N>               name english "<label>"; description english "<text>"; ranked; teambased;
+//                              maxparty <N>; set <dvar> <val>; rule ...; then entry lines "<gametype> <map>"
+// The `ranked` flag is THE per-playlist flag that should make the match grant XP (ties Path B's earned
+// progression to a real playlist). Gated COD4_PLAYLIST. Parser logs "Playlist error: ..." -> iterate.
+extern "C" void __imp__sub_821E6F90(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_821E6F90) {
+  if (env_on("COD4_PLAYLIST")) {
+    static const char kPlaylist[] =
+        "version 21\n"
+        "gametype war\n"
+        "\tname english \"Team Deathmatch\"\n"
+        "\tscript war\n"
+        "playlist 1\n"
+        "\tname english \"Shipment 24/7\"\n"
+        "\tdescription english \"Nonstop close-quarters Team Deathmatch on Shipment.\"\n"
+        "\tranked\n"
+        "\tteambased\n"
+        "\tmaxparty 12\n"
+        "mp_shipment,war,1\n";   // entry = <map>,<gametype>,<weight>  (COMMA-separated; weight>0)
+
+    // COD4_PLAYLIST_FILE lets us iterate the playlist text without rebuilding (fast format RE).
+    static std::string fileBuf;
+    const char* text = kPlaylist; size_t len = sizeof(kPlaylist);
+    if (const char* fp = std::getenv("COD4_PLAYLIST_FILE"); fp && fp[0]) {
+      std::ifstream f(fp, std::ios::binary);
+      if (f) { fileBuf.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+               fileBuf.push_back('\0'); text = fileBuf.c_str(); len = fileBuf.size(); }
+    }
+    uint32_t buf = ctx.r3.u32;
+    if (buf > 0x10000u && buf < 0x90000000u) {
+      std::memcpy(base + buf, text, len);   // includes NUL terminator
+      std::fprintf(stderr, "[COD4MP-PLAYLIST] injected %zu-byte playlist into buffer %08X\n",
+                   len, (unsigned)buf);
+      std::fflush(stderr);
+    }
+  }
+  __imp__sub_821E6F90(ctx, base);
 }
 
 
