@@ -60,14 +60,82 @@ registration) didn't help: the matchmaking server-start almost certainly RE-sets
 session/playlist) AFTER our hook, OR the reject is a different count (e.g. reserved/private slots) that also
 reports "full".
 
-**NEXT (focused):** find `SV_DirectConnect` (server-side connect handler; xref `sv_maxclients` @`0x82055D5C`
-or the `svs.clients` loop) and its "full" branch — see the exact count vs limit it compares at connect time,
-and what sets `sv_maxclients` on the Find-Match server-start (vs our COD4_MAXCLIENTS hook). Likely fix:
-ensure `sv_maxclients` (and/or the session's open/private-slot count) is large enough at the moment the host
-connects — either re-apply the maxclients force on the start path, or fix the slot count the start derives.
-Then host connects → map loads (mp_shipment) → wire System-Link bots (GSCINJECT/BOTSPAWN/BOTAI).
-NOTE: avoid the gdb hardware-read-watchpoint route — `rwatch` fell back to software single-stepping and hung
-the game; use plain breakpoints on `SV_DirectConnect`/`sub_*` instead.
+**✅ ROOT CAUSE FOUND — `SV_DirectConnect` online-connect guard.** The reject literal is
+**`error\nEXE_SERVERISFULL` @`0x8206EBB0`** (a THIRD copy of the key; the `@EXE_SERVERISFULL`@0x8205C558 and
+0x8205D834 copies are the party-ROSTER label, a red herring). Two code refs, both in **`SV_DirectConnect`
+= `sub_822044A0`**:
+- **Site 1 @`0x82204CCC` (checked FIRST):** `r11=[0x82435730]` = the **`onlinegame`** dvar* (name string
+  @0x8205969C, "…online game with stats, custom classes, unlocks"); reads `onlinegame` value (dvar+0xc);
+  if **`onlinegame != 0` AND `[0x84C209D0]+0xc != 0`** → reject. This is the **online direct-connect guard**
+  — under `COD4_LIVE` `onlinegame=1`, and the host's own loopback connect to its freshly-started online
+  server trips it (online games expect matchmaking/invite joins, not plain direct-connect). `0x84C209D0`
+  is a pointer in the session-manager struct (same region as the host-gate byte `0x84C209CB`); `+0xc` is
+  some "session active/closed" flag.
+- **Site 2 @`0x82204D9C`:** classic public-slot scan — start = `sv_privateClients` (`0x82EE1D74`, string
+  @0x82055D6C) value, max = `sv_maxclients` (`0x82EE1D78`) value; if start≥max or no free PUBLIC slot →
+  reject. (sv_maxclients=12 via COD4_MAXCLIENTS didn't help because site 1 fires first.)
+
+**⚠️ 2026-06-26 CORRECTION — SV_DirectConnect was a RED HERRING.** Implemented the site-1 bypass as a
+COD4_MMHOST hook on `sub_822044A0` (clear `[0x84C209D0]+0xc` across the call) AND a diagnostic log on entry.
+**Result: the hook NEVER fires — `SV_DirectConnect` (sub_822044A0) is NEVER CALLED** during the failed
+host-start (entry-log count = 0), and there is still **no SV_SpawnServer / mp_shipment / map load**. So the
+listen server never spawns and the connect path is never reached — the EXE_SERVERISFULL copy in
+SV_DirectConnect (0x8206EBB0) is NOT the modal's source. (The hook is kept, pre-positioned + clearly
+commented, for once server-spawn works; it's gated + harmless meanwhile.)
+
+**REAL modal source FOUND:** the 3rd EXE_SERVERISFULL copy, the **standalone `EXE_SERVERISFULL` @0x8205D834**,
+has a code ref at **`0x822BC400`** — a thin "show-notice" wrapper (loads the key, calls display fn
+`sub_822BAF58`). It has **no direct callers** → it's dispatched from a party **error-code table** (the key is
+also a data-pointer @`0x823A2844`). So the modal "Server is full." is a **party-launch error CODE**, set when
+the party→game-server launch aborts BEFORE spawning the server. The "full" is the symptom; the cause is
+whatever makes the launch set that code.
+
+**NEXT (corrected target):** find where that error code is SET on the party-launch / SpawnServer path
+(trace from XSessionStart's success continuation `0x821AAED8` forward, or from the error dispatcher that
+calls `sub_822BC400` — find the data-table @`0x823A2844` and its parallel handler-fn table, the index = the
+"full" error code, then who sets it). The launch aborts (XSessionStart 000B0014 → XSessionEnd 000B0015 →
+Delete) without ever calling SV_SpawnServer. Determine WHY the server doesn't spawn / what the party-launch
+considers "full" (candidate: session member/slot accounting in the party-launch, distinct from
+sv_maxclients). Lessons banked: SV_DirectConnect not reached; avoid gdb `rwatch` (SW single-step → hang);
+the EXE_SERVERISFULL string has 3 copies (roster label @0x8205C558, SV_DirectConnect @0x8206EBB0, the
+party-error-dispatch one @0x8205D834 — the LAST is the modal).
+
+### ⛔ 2026-06-26 — EXE-HOOK APPROACH EXHAUSTED: the "Server is full" abort is FASTFILE-SCRIPT driven
+Hooked **seven** distinct exe-side mechanisms (gated COD4_MMHOST; all built, and the gate hook sub_821AC9A0
+DID fire as a sanity check) — but every one logged ZERO while the modal still showed + the launch still
+aborted (000B0014 XSessionStart → 000B0015 XSessionEnd): (1) session member-table force @0x84C25660
+(disproven); (2) SV_DirectConnect sub_822044A0 — never called; (3) partyFull handler sub_822BC400 — never
+called; (4) generic notice fn sub_822341A0 — never called; (5) modal-setter sub_822340D0 (only caller is #4)
+— unreachable; (6) gdb breakpoints on #4/#5 — orchestration flaked; (7) Dvar_SetString-by-name sub_821CF6D0
+filtered for error/disconnect dvars — never fires. The modal title "Notice" (com_errorTitle) is ONLY ever
+set by #5, which isn't called → the title comes from a **.menu** file and the trigger (open notice w/
+EXE_SERVERISFULL) is a **uiscript/GSC** action in the IW3 **fastfiles**, NOT in img.bin. So exe-disassembly +
+REX_FUNC hooks **cannot reach this abort**.
+
+**TWO REAL PATHS FORWARD (outside exe hooks):** (A) **Fastfile/GSC** — extract+decompile the IW3 MP fastfiles
+(mp .menu + ui_mp / maps/mp/gametypes GSC), find the party-launch/lobby script that decides "full" and aborts
+pre-SpawnServer, and override it via the project's existing GSC-inject mechanism (gsc_inject/ + disk-serve
+hook sub_8221EF90, memory cod4-mp-botwarfare-gsc). (B) **Pivot** — the System-Link path ALREADY puts bots in
+a real playing match (memory cod4-mp-bots-playing / cod4-mp-botwarfare-gsc); for "bots in a match" that works
+today; only the *Live* Find-Match launch is blocked, at the script layer. Reverted all 7 diagnostic hooks
+(tree = commit 9e449fd, gate-only). host/lobby/countdown/XSessionStart all still WORK.
+
+**2026-06-26 — FASTFILE/GSC ROUTE INVESTIGATED → also blocked.** (a) `COD4_GSCPROBE=1` through the full
+Find-Match lobby→countdown→launch→abort logs **ZERO `Scr_LoadScript`** — no GSC runs in that flow (gametype
+GSC only loads at SpawnServer, which we never reach). So the project's GSC-inject override (`sub_8221EF90`,
+serves GSC source by name) **cannot reach this abort** — there is no GSC to override. (b) The 360 fastfiles
+are **signed/encrypted** (`ui_mp.ff` = `IWff0100` + `IWffs100` block, not plain zlib — no zlib stream in the
+header), so offline `.menu` extraction is non-trivial, AND the project has **no menu/rawfile override hook**
+(only the GSC one). So the abort — which is in the **menu/engine** layer (modal title "Notice" comes from a
+`.menu`; the trigger is menu/uiscript + an engine decision none of the 7 exe hooks caught) — is unreachable
+by both exe hooks and content injection with the current toolchain.
+
+**To actually reach a Live match would require NEW infrastructure** (not a quick fix): a 360 signed-fastfile
+extractor + zone parser to read/modify the MP `.menu`/uiscript, AND a runtime menu/rawfile-override hook
+(analogous to the GSC one) — OR cracking the engine's pre-SpawnServer launch-abort decision, which resisted
+7 distinct hook attempts (the decision/trigger is not in any error-display fn, SV_DirectConnect, the party
+message handlers, the dvar-set-by-name path, or GSC). **PIVOT for "bots in a match" today: the System-Link
+path already works** (`COD4_GSCINJECT/BOTSPAWN/BOTAI`, memory `cod4-mp-bots-playing` / `cod4-mp-botwarfare-gsc`).
 
 **Two cleanups still owed:** (1) replace the `party_minplayers` poke with a shipped lever (game-side
 `[COD4MP-*]` or set it in the party config); (2) make host-fallback fire WITHOUT `COD4_MM_SEARCH_DELAY_MS`.
