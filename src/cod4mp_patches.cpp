@@ -922,6 +922,36 @@ REX_FUNC(sub_821E6F90) {
   __imp__sub_821E6F90(ctx, base);
 }
 
+// [COD4MP-GAMETYPEFIX] (gated COD4_PLAYLIST) Fix the lobby/scoreboard gametype LABEL for our custom
+// Find-Match modes. RE (sub-agent, 2026-06-26): at Start Match, sub_82202CE8 validates `g_gametype` against
+// the RUNTIME gametype registry (sub_8225E520 builds it from maps/mp/gametypes/_gametypes.txt + per-mode
+// .txt). Our playlist's modes (dom/sab/sd/koth/...) aren't in that registry, so the validator sub_82254EC8
+// returns 0 and sub_82202CE8 hardcodes a fallback to "dm" for the DISPLAY name + the Xbox Live session
+// gametype context — so e.g. a Domination scoreboard reads "Free For All" (dm's display name) even though
+// the dom gametype SCRIPT runs correctly. Fix: when the validator fails for a KNOWN gametype AND it was
+// called from sub_82202CE8's Start-Match site (lr == 0x82202DA8, the instruction after `bl` @0x82202DA4),
+// return non-null so sub_82202CE8 keeps the real g_gametype. sub_82202CE8 only NULL-checks this result (it
+// never dereferences the record), and the lr gate leaves the validator's other callers untouched.
+extern "C" void __imp__sub_82254EC8(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_82254EC8) {
+  uint32_t name_va = ctx.r3.u32;            // input = lowercased g_gametype name (guest char*)
+  uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  __imp__sub_82254EC8(ctx, base);
+  if (env_on("COD4_PLAYLIST") && ctx.r3.u32 == 0 && lr == 0x82202DA8u &&
+      name_va > 0x10000u && name_va < 0xF0000000u) {
+    const char* nm = reinterpret_cast<const char*>(base + name_va);
+    static const char* kGt[] = { "war", "tdm", "dm", "dom", "sab", "sd", "koth", "hq", "ctf", "dom_old" };
+    for (const char* g : kGt) {
+      size_t n = std::strlen(g);
+      if (std::strncmp(nm, g, n) == 0 && (nm[n] == '\0' || nm[n] == ' ')) {
+        ctx.r3.u32 = name_va;               // non-null -> keep the real gametype -> correct display label
+        log_once("[COD4MP-GAMETYPEFIX] kept custom gametype valid (lobby/scoreboard label fixed)");
+        break;
+      }
+    }
+  }
+}
+
 
 // [COD4MP-SVPROBE] sub_82205CB8 = SV_ExecuteClientCommand(client_t* cl, char* cmd, int clientOK).
 // Found empirically: the human's Choose-Team -> Auto-Assign sent "mr 16 4 autoassign" through it
