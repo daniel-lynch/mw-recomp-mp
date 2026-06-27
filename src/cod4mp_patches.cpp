@@ -356,6 +356,47 @@ REX_FUNC(sub_822B31B0) {
 // connstate (*(0x82435780)) is mid-connect (>0 and <9=CA_ACTIVE; ==0 at menu/lobby where the host still
 // needs the flag to set up hosting, ==9 once joined). Done from Com_Frame (sub_822367B8, the main loop) so
 // it covers every connect retry with a tight, self-limiting window. Gated COD4_MMHOST.
+// [COD4MP] DB session roster (name + rank) parsed from tools/botdb/select_roster.py's roster.txt
+// ("name|rank|prestige|skill|playstyle|fav"). Used by COD4_FAKEPARTY (lobby roster) so the lobby members
+// match the in-match bots (which COD4_BOTNAMES names from the same file). Path = COD4_BOTROSTER, else
+// <data>/cod4_mp/roster.txt. Loaded once.
+struct RosterEntry { std::string name; uint32_t rank; };
+[[maybe_unused]] static const std::vector<RosterEntry>& rosterEntries() {
+  static const std::vector<RosterEntry> v = [] {
+    std::vector<RosterEntry> r;
+    std::string path;
+    if (const char* e = std::getenv("COD4_BOTROSTER"); e && e[0]) {
+      path = e;
+    } else {
+      const char* xdg = std::getenv("XDG_DATA_HOME");
+      const char* home = std::getenv("HOME");
+      std::string root = (xdg && xdg[0]) ? xdg : (std::string(home ? home : ".") + "/.local/share");
+      path = root + "/cod4_mp/roster.txt";
+    }
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.empty()) continue;
+      size_t p0 = line.find('|');
+      std::string nm = (p0 == std::string::npos) ? line : line.substr(0, p0);
+      uint32_t rank = 0;
+      if (p0 != std::string::npos) {
+        size_t p1 = line.find('|', p0 + 1);
+        std::string rs = line.substr(p0 + 1, (p1 == std::string::npos ? line.size() : p1) - (p0 + 1));
+        rank = (uint32_t)std::strtoul(rs.c_str(), nullptr, 10);
+      }
+      if (!nm.empty()) r.push_back({ nm.substr(0, 30), rank });
+    }
+    if (!r.empty()) std::fprintf(stderr, "[COD4MP-FAKEPARTY] loaded %zu roster entries\n", r.size());
+    return r;
+  }();
+  return v;
+}
+[[maybe_unused]] static inline void wr32be(uint8_t* base, uint32_t ga, uint32_t v) {
+  uint32_t b = __builtin_bswap32(v);
+  std::memcpy(base + ga, &b, 4);
+}
+
 extern "C" void __imp__sub_822367B8(PPCContext& ctx, uint8_t* base);
 REX_FUNC(sub_822367B8) {
   if (env_on("COD4_MMHOST")) {
@@ -366,6 +407,54 @@ REX_FUNC(sub_822367B8) {
         uint32_t zero = 0u;
         std::memcpy(base + sm + 0xcu, &zero, 4);     // online guard now sees flag==0 -> host connect accepted
         log_once("[COD4MP-MMHOST] connect-window: cleared session flag so host can join its own match");
+      }
+    }
+  }
+  // [COD4MP-FAKEPARTY] Put the DB "bots" in the Find-Match party/lobby roster pre-match (RE: sub-agent
+  // 2026-06-26). Party member array @0x8246C480 (base 0x8246B280 + 0x1200), stride 0xC0; per slot: +0x00
+  // state(3=active), +0x01 flag(0=shown), +0x10 name(asciiz, 31B), +0xA4 rank, +0x08 XUID, +0x50 last-heard
+  // timestamp (a ~12s reaper resets the slot unless refreshed). The roster panel (sub_822BB4B8) reads this
+  // array directly, and the member COUNT is the same array — so these also satisfy party_minplayers. Same
+  // roster as COD4_BOTNAMES => the lobby names match the in-match bots. Inject only while WE are the host AND
+  // the lobby is up AND we're not yet in a match; copy the local player's (slot 0) fresh timestamp to defeat
+  // the reaper; refresh every frame. Gated COD4_FAKEPARTY (off by default).
+  if (env_on("COD4_FAKEPARTY")) {
+    uint32_t phDvar = rd32(base, 0x8243BDC0u);                       // party_host dvar*
+    // party-dvar bool value lives at dvar+0xC (big-endian; the bool is the top/first byte) — verified live
+    uint8_t host = (phDvar >= 0x82000000u && phDvar < 0x86000000u) ? *(base + phDvar + 0xcu) : 0;
+    bool lobbyUp = rd32(base, 0x8246B280u + 0x2F00u) && rd32(base, 0x8246B280u + 0x2EF4u) &&
+                   rd32(base, 0x8246B280u + 0x2EFCu);
+    uint32_t cs = rd32(base, 0x82435780u);                           // cl0 connstate (0=lobby, 9=in match)
+    const std::vector<RosterEntry>& roster = rosterEntries();
+    uint32_t mpDvar = rd32(base, 0x8243BDD8u);                       // party_maxplayers dvar*
+    int maxp = (mpDvar >= 0x82000000u && mpDvar < 0x86000000u) ? (int)rd32(base, mpDvar + 0xcu) : 18;
+    int n = (int)roster.size();
+    if (n > maxp - 1) n = maxp - 1;
+    if (n > 17) n = 17;
+    if (host == 1 && lobbyUp && cs == 0u) {                          // host, lobby up, NOT yet connecting
+      uint32_t ts = rd32(base, 0x8246C480u + 0x50u);                 // local player's fresh last-heard time
+      for (int i = 0; i < n; i++) {
+        uint32_t slot = 0x8246C480u + (uint32_t)(i + 1) * 0xC0u;     // slot 0 stays the local player
+        const std::string& nm = roster[i].name;
+        size_t L = nm.size() > 30 ? 30 : nm.size();
+        std::memcpy(base + slot + 0x10u, nm.data(), L);
+        *(base + slot + 0x10u + L) = '\0';
+        wr32be(base, slot + 0xA4u, roster[i].rank);                  // rank
+        wr32be(base, slot + 0x08u, 0xFACE0000u + (uint32_t)i);       // unique XUID hi (also our fake marker)
+        wr32be(base, slot + 0x0Cu, 0u);
+        wr32be(base, slot + 0x38u, 0xFACE0000u + (uint32_t)i);       // unique allocator identity key
+        wr32be(base, slot + 0x50u, ts);                              // fresh timestamp (defeat the reaper)
+        *(base + slot + 0x01u) = 0;                                  // display flag -> shown
+        *(base + slot + 0x00u) = 3;                                  // state -> active (write LAST)
+      }
+      log_once("[COD4MP-FAKEPARTY] injected DB bots into the party lobby roster");
+    } else if (cs != 0u) {
+      // The match-launch has begun (connecting / in-match). Remove our fakes so the party->game-session
+      // migration doesn't wait on phantom peers. Only clear slots WE own (fake XUID marker 0xFACE00xx).
+      for (int i = 0; i < n; i++) {
+        uint32_t slot = 0x8246C480u + (uint32_t)(i + 1) * 0xC0u;
+        if (rd32(base, slot + 0x08u) == 0xFACE0000u + (uint32_t)i)
+          *(base + slot + 0x00u) = 0;                                // state -> empty
       }
     }
   }
