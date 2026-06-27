@@ -22,12 +22,19 @@ cd "$BIN_DIR"
 # Instance A — HOST (sees only pad A)
 setsid env SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="0x045e/0x028e" \
   COD4_LIVE=1 COD4_PLAYLIST=1 COD4_MMHOST=1 COD4_MAXCLIENTS=12 COD4_MM_SEARCH_DELAY_MS=6000 \
+  COD4_MM_BROKER=1 COD4_MM_REGISTRY=/tmp/cod4_mp_sessions \
   COD4_GSCINJECT=1 COD4_BOTSPAWN=1 COD4_BOTAI=1 COD4_BOTSETTLE=120 COD4_BOTNAMES=1 COD4_STATS=1 \
   DISPLAY=:1 ./cod4_mp --game_data_root=/home/dlynch/Games/cod4 >/tmp/cod4_A.log 2>&1 < /dev/null &
 sleep 14
-# Instance B — JOINER (sees only pad B; separate writable data dir so profiles don't collide)
+# Instance B — JOINER (sees only pad B; separate writable data dir so profiles don't collide).
+# Primary path: matchmaking broker — B runs Find Match, its XSessionSearch reads the shared registry,
+# discovers A's published session and JOINS it through the title's Live-join (XNet set up by the join).
+# So B gets COD4_MM_BROKER + the same Find-Match playlist config, but does NOT host (no MMHOST/delay).
+# Fallback path (plan-B direct connect): set COD4_HOST_IP=<ip:port> when invoking to instead have B
+# issue `connect <ip>` from its menu via COD4_AUTOCONNECT (bypasses matchmaking; XNet may reject it).
 setsid env SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="0x045e/0x028f" XDG_DATA_HOME=/tmp/cod4_p2_data \
-  COD4_LIVE=1 \
+  COD4_LIVE=1 COD4_PLAYLIST=1 COD4_MM_BROKER=1 COD4_MM_REGISTRY=/tmp/cod4_mp_sessions \
+  ${COD4_HOST_IP:+COD4_AUTOCONNECT="$COD4_HOST_IP"} \
   DISPLAY=:1 ./cod4_mp --game_data_root=/home/dlynch/Games/cod4 >/tmp/cod4_B.log 2>&1 < /dev/null &
 sleep 14
 

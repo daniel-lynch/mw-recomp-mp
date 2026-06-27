@@ -397,7 +397,8 @@ struct RosterEntry { std::string name; uint32_t rank; };
   std::memcpy(base + ga, &b, 4);
 }
 
-extern "C" void __imp__sub_822367B8(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_822367B8(PPCContext& ctx, uint8_t* base);   // Com_Frame
+extern "C" void __imp__sub_82238420(PPCContext& ctx, uint8_t* base);   // Cmd_ExecuteSingleCommand(local, ctrl, text)
 REX_FUNC(sub_822367B8) {
   if (env_on("COD4_MMHOST")) {
     uint32_t cs = rd32(base, 0x82435780u);          // cl0 connstate
@@ -455,6 +456,39 @@ REX_FUNC(sub_822367B8) {
         uint32_t slot = 0x8246C480u + (uint32_t)(i + 1) * 0xC0u;
         if (rd32(base, slot + 0x08u) == 0xFACE0000u + (uint32_t)i)
           *(base + slot + 0x00u) = 0;                                // state -> empty
+      }
+    }
+  }
+  // [COD4MP-AUTOCONNECT] Second-client / friend-join direct connect (plan B testing toward Live P2P).
+  // Fires `connect <ip:port>` once from the main menu via Cmd_ExecuteSingleCommand (sub_82238420; RE:
+  // sub-agent 2026-06-26). r3=localClientNum(0), r4=controllerIndex(0), r5=text VA. That call tokenizes
+  // AND dispatches, so CL_Connect_f reads its own Cmd_Argv(1) — we just hand it "connect <ip>". Gate to
+  // once, only at the menu (connstate 0) and after a short settle so the menu/network is up. The string
+  // is staged in guest scratch below the current stack, identical to cod4_client_cmd. COD4_AUTOCONNECT=
+  // "127.0.0.1:28960" enables it. Optional COD4_AUTOCONNECT_DELAY (frames to wait, default 600 ~10s).
+  if (const char* ip = getenv("COD4_AUTOCONNECT")) {
+    static bool did = false;
+    static int settle = 0;
+    if (!did && ip[0]) {
+      uint32_t cs = rd32(base, 0x82435780u);                 // cl0 connstate (0 = menu/idle)
+      if (cs == 0u) {
+        const char* dly = getenv("COD4_AUTOCONNECT_DELAY");
+        int need = dly ? atoi(dly) : 600;
+        if (++settle >= need) {
+          char cmd[160];
+          int n = snprintf(cmd, sizeof cmd, "connect %s", ip);
+          uint32_t va = (ctx.r1.u32 - 0x800u) & ~0xFu;       // scratch below current frame
+          char* d = (char*)(base + va);
+          for (int i = 0; i <= n && i < (int)sizeof cmd; i++) d[i] = cmd[i];
+          PPCContext save = ctx;
+          ctx.r3.u32 = 0; ctx.r4.u32 = 0; ctx.r5.u32 = va;   // (localClientNum, controllerIndex, text)
+          __imp__sub_82238420(ctx, base);
+          ctx = save;
+          did = true;
+          log_once("[COD4MP-AUTOCONNECT] issued direct connect to host");
+        }
+      } else {
+        settle = 0;                                          // left the menu before settling; reset
       }
     }
   }
