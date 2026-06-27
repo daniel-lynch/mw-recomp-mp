@@ -1,5 +1,12 @@
 # Matchmaking / "Mock 360" Live — IMPLEMENTATION HANDOFF
 
+> **2026-06-26 NEXT STEP → see [`matchmaking-guestjoin-handoff.md`](matchmaking-guestjoin-handoff.md).**
+> The cross-instance **matchmaking broker** (discovery + QoS + host port plumbing + unique XNKID) is built,
+> committed, and trace-proven (SDK `3abf11a`+`e90cc2f`, game `8dab407`, branch `feat/matchmaking-broker`).
+> Remaining blocker = the **guest-join**: the joiner finds the host and calls `XGISessionJoinRemote` but
+> loops (host/guest inversion + JoinRemote stub) instead of connecting. That handoff has the full diagnosis,
+> reproduction harness, observability, and implementation plan.
+
 **START HERE for the matchmaking work.** Strategic direction (per owner): implement Xbox Live **properly**
 as a reusable **mock-360 session/matchmaking layer in the SDK** (`rexglue-sdk`), even if slower — this code
 is generic Xbox API (XGI/XSession, XLiveBase, XAM), not CoD4-specific, so it benefits **every** recomp and
