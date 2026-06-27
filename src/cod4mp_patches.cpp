@@ -30,6 +30,7 @@
 #include <iterator>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -371,13 +372,44 @@ REX_FUNC(sub_822367B8) {
   __imp__sub_822367B8(ctx, base);
 }
 
-// [COD4MP-BOTNAMES] Give bots real-looking names instead of "botN". SV_AddTestClient (sub_82205A10) builds
-// each bot's connect string `connect "...\name\botN\xuid\...\protocol\..."` (the `bot%d` template @0x8206F058,
+// [COD4MP-BOTNAMES] DB-driven session roster names, written by tools/botdb/select_roster.py (one bot per
+// line, "name|rank|prestige|skill|playstyle|fav_gametype" in spawn order). Path = COD4_BOTROSTER, else
+// <data>/cod4_mp/roster.txt. Loaded once; if present + non-empty, bots are named from this living
+// "population" (regulars + randoms who are "online now") instead of the built-in MW roster below.
+static const std::vector<std::string>& rosterNames() {
+  static const std::vector<std::string> names = [] {
+    std::vector<std::string> v;
+    std::string path;
+    if (const char* e = std::getenv("COD4_BOTROSTER"); e && e[0]) {
+      path = e;
+    } else {
+      const char* xdg = std::getenv("XDG_DATA_HOME");
+      const char* home = std::getenv("HOME");
+      std::string root = (xdg && xdg[0]) ? xdg : (std::string(home ? home : ".") + "/.local/share");
+      path = root + "/cod4_mp/roster.txt";
+    }
+    std::ifstream f(path);
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.empty()) continue;
+      auto bar = line.find('|');
+      std::string nm = (bar == std::string::npos) ? line : line.substr(0, bar);
+      if (!nm.empty()) v.push_back(nm.substr(0, 24));   // cap to the in-place-rewrite slack
+    }
+    if (!v.empty())
+      std::fprintf(stderr, "[COD4MP-BOTNAMES] loaded %zu roster names from %s\n", v.size(), path.c_str());
+    return v;
+  }();
+  return names;
+}
+
+// [COD4MP-BOTNAMES] Give bots real names instead of "botN". SV_AddTestClient (sub_82205A10) builds each
+// bot's connect string `connect "...\name\botN\xuid\...\protocol\..."` (the `bot%d` template @0x8206F058,
 // number from a counter @0x852EA810) and passes it to the connect-queue consumer sub_822380C8 (r3 = the
-// command string). We intercept that string and rewrite the `\name\` value from "botN" to a name off a
-// built-in roster, IN PLACE (the ~190-byte string sits in a 0x200 stack buffer, so a few extra chars fit),
-// so the new name flows naturally through userinfo -> client->name -> scoreboard/killcam with no offset RE.
-// Gated COD4_BOTNAMES so the default build is unaffected.
+// command string). We intercept that string and rewrite the `\name\` value from "botN" to the next roster
+// name (DB session roster if present, else the built-in MW list), IN PLACE (the ~190-byte string sits in a
+// 0x200 stack buffer, so the longer name fits), so it flows through userinfo -> client->name ->
+// scoreboard/killcam with no offset RE. Gated COD4_BOTNAMES.
 extern "C" void __imp__sub_822380C8(PPCContext& ctx, uint8_t* base);
 REX_FUNC(sub_822380C8) {
   if (env_on("COD4_BOTNAMES")) {
@@ -391,11 +423,16 @@ REX_FUNC(sub_822380C8) {
             "Soap", "Price", "Gaz", "Ghost", "Roach", "MacTavish", "Nikolai", "Kamarov",
             "Griggs", "Vasquez", "Foley", "Dunn", "Ramirez", "Sandman", "Frost", "Wallcroft" };
           static std::atomic<uint32_t> nameIdx{0};
-          const char* nm = kNames[nameIdx.fetch_add(1) % (sizeof(kNames) / sizeof(kNames[0]))];
+          const std::vector<std::string>& roster = rosterNames();
+          uint32_t idx = nameIdx.fetch_add(1);
+          std::string held;                                        // keep a roster string alive for nm
+          const char* nm;
+          if (!roster.empty()) { held = roster[idx % roster.size()]; nm = held.c_str(); }
+          else nm = kNames[idx % (sizeof(kNames) / sizeof(kNames[0]))];
           char* vstart = np + 6;                                   // start of "botN"
           char* vend = std::strchr(vstart, '\\');                  // backslash after the name value
           size_t newlen = std::strlen(nm);
-          if (vend && newlen <= 16) {
+          if (vend && newlen >= 1 && newlen <= 24) {
             std::memmove(vstart + newlen, vend, std::strlen(vend) + 1);  // shift suffix (incl NUL) to fit
             std::memcpy(vstart, nm, newlen);
             log_once("[COD4MP-BOTNAMES] renamed bot from botN to a roster name");
