@@ -650,6 +650,18 @@ static constexpr uint32_t kStatBlockSize = 16924u;
     lastSave = std::time(nullptr);
     return;
   }
+  // Earned-progression display fix (NOT a force-unlock). Create-a-Class / the Barracks rank panel gate on
+  // the stat block's rank byte (252) AND the validity flags (260/261/263); if those flags are 0 the menu
+  // "falls back to Lv1 and locks the gates" even when you've actually ranked up. The game raises the rank
+  // byte as you EARN XP but doesn't set these flags on the recomp's block, so a legitimately-earned rank
+  // stays locked in the menu. Once there's real earned rank (byte 252 > 0), mark the block valid so the
+  // menu reflects YOUR earned level and Create-a-Class unlocks at the level you've actually reached. Rank
+  // and unlocks are untouched — only the validity markers are set, and only when rank was genuinely earned.
+  uint8_t* blk = base + kStatBlock;
+  if (blk[4 + 252] > 0 && (blk[4 + 260] == 0 || blk[4 + 261] == 0 || blk[4 + 263] == 0)) {
+    blk[4 + 260] = 1; blk[4 + 261] = 1; blk[4 + 263] = 1;
+    log_once("[COD4MP-STATS] earned rank detected -> set validity flags (menu now reflects your earned level)");
+  }
   std::time_t now = std::time(nullptr);
   if (now - lastSave >= 30) { lastSave = now; saveStatBlock(base); }  // autosave accrued progress
 }
