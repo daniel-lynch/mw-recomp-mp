@@ -238,13 +238,22 @@ No bots, no host flags. Point `COD4_MM_PEERS` at the host, use your own IP:
 $env:COD4_LIVE         = "1"
 $env:COD4_PLAYLIST     = "1"
 $env:COD4_MM_BROKER    = "1"
-$env:COD4_MM_PEERS     = "192.168.2.2"           # the HOST's IP — turns on the UDP network broker
-$env:COD4_LOCAL_IP     = "172.16.x.x"            # YOUR real VPN IP (the friend's actual address)
-$env:COD4_MM_NOREROUTE = "1"
-$env:COD4_MM_PORT_IDX  = "2"
+$env:COD4_MM_PEERS         = "192.168.2.2"       # the HOST's IP — turns on the UDP network broker
+$env:COD4_LOCAL_IP         = "172.16.x.x"        # YOUR real VPN IP (the friend's actual address)
+$env:COD4_MM_NOREROUTE     = "1"
+$env:COD4_MM_PORT_IDX      = "2"
+$env:COD4_MM_SEARCH_DELAY_MS = "10000"           # CRUCIAL: hold Find Match ~10s so the broker rendezvous
+                                                 # completes — otherwise the joiner host-falls-back before
+                                                 # the host's session arrives and you BOTH end up hosting
 
 .\cod4_mp.exe --game_data_root=C:\path\to\cod4\gamedata
 ```
+
+> **If the joiner "goes straight to hosting its own game,"** this flag is missing or too small. First contact
+> is one-way (the joiner beacons the host, the host then learns it and gossips its session back), so the
+> joiner's *first* search is empty by definition; without the delay its title instantly host-falls-back. 10 s
+> covers the round trip comfortably. (The host is unaffected — `COD4_MMHOST` makes it always host and never
+> adopt, so even a delay there is harmless.)
 
 ### 7.5 Drive sequence (real controllers)
 
