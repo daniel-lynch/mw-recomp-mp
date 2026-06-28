@@ -153,7 +153,13 @@ This is the new headline. Two **separate machines** (you + a friend), both on th
 Find-Match game** with bots. One machine is the **HOST**, the other is the **JOINER**. There is no real Xbox
 Live — a tiny **network broker** stands in for the Live matchmaking service: the host advertises its session
 **directly to the joiner over UDP** (no shared folder, no SMB), the joiner discovers it and connects over the
-VPN. Each side just needs to know the **other machine's IP**.
+VPN. **Only the JOINER needs to know an IP — the host's.** The host auto-learns the joiner's address from its
+first packet, so it doesn't need to know the joiner's IP in advance (handy when the joiner is on a different
+subnet, e.g. a `172.16.x.x` VPN address).
+
+> **The example IPs below are placeholders.** Use your real VPN addresses. In our setup the **host is
+> `192.168.2.2`** and the **joiner is a `172.16.x.x`** address — substitute accordingly. The only IP that has
+> to be typed anywhere is the **host's**, into the joiner's `COD4_MM_PEERS`.
 
 > **Honesty note (read this):** this path was developed and **validated same-box** using Linux network
 > namespaces to emulate "two real machines with distinct IPs" — two clients + 9 bots in one Team Deathmatch,
@@ -165,17 +171,18 @@ VPN. Each side just needs to know the **other machine's IP**.
 
 ### 7.1 What each side needs
 
-| | HOST (your friend) | JOINER (you, `192.168.2.2`) |
+| | HOST (you, `192.168.2.2`) | JOINER (your friend, `172.16.x.x`) |
 |---|---|---|
 | Role | hosts the match + runs the bots | joins the host's match |
-| `COD4_LOCAL_IP` | **its own** VPN IP, e.g. `192.168.2.1` | **its own** VPN IP, `192.168.2.2` |
-| `COD4_MM_PEERS` | the **other** machine's IP (`192.168.2.2`) | the **other** machine's IP (`192.168.2.1`) |
+| `COD4_LOCAL_IP` | **its own** VPN IP (`192.168.2.2`) | **its own** VPN IP (`172.16.x.x`) |
+| broker enable | `COD4_MM_NETBROKER=1` (auto-learns the joiner) | `COD4_MM_PEERS=192.168.2.2` (the host's IP) |
 | Bots | yes (host owns the bots) | no |
 
-`COD4_MM_PEERS` is what turns on the network broker — set it to the **other** machine's VPN IP (comma-separate
-if more than one). No shared filesystem, no UNC paths. The broker gossips on **UDP port 31100** by default
-(override with `COD4_MM_BROKER_PORT`, same value on both). You may safely list *both* IPs on both machines if
-that's easier to script — an instance ignores records that came from itself.
+Either `COD4_MM_NETBROKER=1` **or** `COD4_MM_PEERS=<ip[,ip…]>` turns on the network broker. The host uses
+`COD4_MM_NETBROKER=1` and learns the joiner from its inbound packets; the joiner uses
+`COD4_MM_PEERS=<host IP>`. (If you'd rather be explicit, you *can* set `COD4_MM_PEERS` on both sides to the
+other's IP — self-originated records are ignored, so listing both IPs on both machines is also fine.) The
+broker gossips on **UDP port 31100** by default (override with `COD4_MM_BROKER_PORT`, same value on both).
 
 ### 7.2 Firewall (both machines)
 
@@ -189,7 +196,7 @@ New-NetFirewallRule -DisplayName "cod4mm-udp" -Direction Inbound -Action Allow `
 
 (If your VPN exposes its own adapter/profile, make sure the rule applies to it — set `-Profile Any` if unsure.)
 
-### 7.3 HOST — launch (your friend's machine, IP `192.168.2.1` here)
+### 7.3 HOST — launch (your machine, IP `192.168.2.2`)
 
 Same build + `cod4_mp.toml` as section 6. Set these in the SAME shell, then launch:
 
@@ -202,8 +209,8 @@ $env:COD4_LIVE         = "1"                    # Xbox LIVE menus (Find Match)
 $env:COD4_PLAYLIST     = "1"                    # populate the Find-Match playlist
 $env:COD4_MMHOST       = "1"                    # host the match (loopback connect-window fix)
 $env:COD4_MM_BROKER    = "1"                    # enable the broker (advertise + aggregate)
-$env:COD4_MM_PEERS     = "192.168.2.2"          # the JOINER's IP — turns on the UDP network broker
-$env:COD4_LOCAL_IP     = "192.168.2.1"          # this host's REAL VPN IP
+$env:COD4_MM_NETBROKER = "1"                    # network broker; auto-learns the joiner (no joiner IP needed)
+$env:COD4_LOCAL_IP     = "192.168.2.2"          # this host's REAL VPN IP
 
 # --- matchmaking join glue (validated set) ---
 $env:COD4_MM_ARBEMPTY  = "1"   # host aborts its own start so the joiner can seat
@@ -223,7 +230,7 @@ $env:COD4_BOTAI      = "1"
 .\cod4_mp.exe --game_data_root=C:\path\to\cod4\gamedata
 ```
 
-### 7.4 JOINER — launch (your machine, IP `192.168.2.2`)
+### 7.4 JOINER — launch (your friend's machine, IP `172.16.x.x`)
 
 No bots, no host flags. Point `COD4_MM_PEERS` at the host, use your own IP:
 
@@ -231,8 +238,8 @@ No bots, no host flags. Point `COD4_MM_PEERS` at the host, use your own IP:
 $env:COD4_LIVE         = "1"
 $env:COD4_PLAYLIST     = "1"
 $env:COD4_MM_BROKER    = "1"
-$env:COD4_MM_PEERS     = "192.168.2.1"           # the HOST's IP — turns on the UDP network broker
-$env:COD4_LOCAL_IP     = "192.168.2.2"           # YOUR real VPN IP
+$env:COD4_MM_PEERS     = "192.168.2.2"           # the HOST's IP — turns on the UDP network broker
+$env:COD4_LOCAL_IP     = "172.16.x.x"            # YOUR real VPN IP (the friend's actual address)
 $env:COD4_MM_NOREROUTE = "1"
 $env:COD4_MM_PORT_IDX  = "2"
 
@@ -247,7 +254,7 @@ Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playl
    gossiping its session and have a few bots seated before the joiner searches.
 2. **JOINER then** picks the same playlist and presses through Find Match. It discovers the host's session
    (received over UDP from the host), shows **"Trying to join potential match"**, and connects to
-   `192.168.2.1:59651` over the VPN.
+   `192.168.2.2:59651` over the VPN.
 3. The host's match **aborts its own start** (`ARBEMPTY`) so the lobby stays open; the joiner seats. On the
    host you'll briefly see the joiner appear, the arbitration **kick is swallowed** (`NOKICK`), and the
    joiner is **not dropped** (`NODROP`). Joiner advances `connstate 8 → 9` (PRIMED → ACTIVE).
@@ -256,19 +263,28 @@ Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playl
 
 ### 7.6 If it doesn't connect — which half failed
 
-- **Joiner never sees a match** (Find Match stays empty): the broker gossip isn't reaching the joiner. Check
-  that each side's `COD4_MM_PEERS` is the **other** machine's IP (not its own), that `COD4_MM_BROKER=1` on
-  both, and that **UDP 31100** is open inbound on both (the firewall rule above). This is the broker-reach hop.
+- **Joiner never sees a match** (Find Match stays empty): the broker gossip isn't crossing the VPN. Check the
+  joiner's `COD4_MM_PEERS` is the **host's** IP (`192.168.2.2`), the host has `COD4_MM_NETBROKER=1`,
+  `COD4_MM_BROKER=1` on both, and **UDP 31100** is open inbound on both (the firewall rule above). On the host
+  the trace should log `NETBROKER: learned peer <joiner ip>:<port>` once the joiner reaches Find Match — if it
+  never does, the joiner's packets aren't arriving (firewall / `COD4_MM_PEERS` / VPN reach). This is the
+  broker-reach hop.
 - **Joiner says "joining" then drops / times out**: the *game* UDP didn't traverse the VPN even though the
   broker did. Confirm the firewall rule on the **host** for inbound UDP `59651`, and that the joiner can reach
-  `192.168.2.1` at all (`Test-NetConnection 192.168.2.1` — note ICMP may be blocked even when UDP works). This
+  `192.168.2.2` at all (`Test-NetConnection 192.168.2.2` — note ICMP may be blocked even when UDP works). This
   is the game-port hop.
 - **Joiner connects then gets kicked after a few seconds**: the `COD4_MM_NODROP` / `COD4_MM_NOKICK` flags
   aren't set on the **host**. Re-check the host's env block.
 
-> The broker's diagnostic trace still goes to a local `trace.log` under your temp dir (or `COD4_MM_REGISTRY`
-> if you set one — optional, used only for the log now). On the host it should show `PUBLISH(net)` and
-> `NETBROKER: listening udp/31100`; on the joiner, `SEARCH: RETURNED 1 host session(s)`.
+> Routing note: the host's replies go back to whatever source address the joiner's packets arrived from, so
+> the host needs a route to the joiner's subnet over the VPN. On a typical split-tunnel VPN this is automatic
+> (e.g. here `ip route get 172.16.0.5` resolves `via <vpn gw> dev tun0`). If the joiner is on a subnet your VPN
+> doesn't route, the host's replies will leak out the default gateway and never arrive.
+
+> The broker's diagnostic trace goes to a local `trace.log` (under `%TEMP%\cod4_mp_sessions` on Windows, or
+> `COD4_MM_REGISTRY` if you set one — used only for the log now). Host should show `NETBROKER: listening
+> udp/31100`, `PUBLISH(net)`, and `NETBROKER: learned peer …`; joiner should show `SEARCH: RETURNED 1 host
+> session(s)`.
 
 ---
 
