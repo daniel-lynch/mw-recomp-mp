@@ -151,15 +151,17 @@ After you spawn in, the bots load themselves in one at a time (watch the scorebo
 
 This is the new headline. Two **separate machines** (you + a friend), both on the same VPN, join the **same
 Find-Match game** with bots. One machine is the **HOST**, the other is the **JOINER**. There is no real Xbox
-Live — a small file-based **broker** stands in for the Live matchmaking service: the host advertises its
-session into a shared folder, the joiner discovers it there and connects directly over the VPN.
+Live — a tiny **network broker** stands in for the Live matchmaking service: the host advertises its session
+**directly to the joiner over UDP** (no shared folder, no SMB), the joiner discovers it and connects over the
+VPN. Each side just needs to know the **other machine's IP**.
 
 > **Honesty note (read this):** this path was developed and **validated same-box** using Linux network
 > namespaces to emulate "two real machines with distinct IPs" — two clients + 9 bots in one Team Deathmatch,
-> joiner spawned into first-person and stayed in for 150 s+. The **real two-machine-over-VPN run is the live
-> test you're about to do.** It uses the identical SDK real-IP mode; what's unproven is your VPN's
-> UDP reachability + the shared-folder broker over SMB. If it doesn't connect, the diagnostics at the end
-> tell you which of those two it is.
+> joiner spawned into first-person and stayed in for 150 s+, and the network broker's UDP gossip was verified
+> moving session/arbitration records bidirectionally between the two distinct IPs. The **real
+> two-machine-over-VPN run is the live test you're about to do.** It uses the identical SDK real-IP mode; the
+> one thing only your VPN can confirm is that it passes UDP between you. If it doesn't connect, the
+> diagnostics at the end tell you which hop failed.
 
 ### 7.1 What each side needs
 
@@ -167,20 +169,22 @@ session into a shared folder, the joiner discovers it there and connects directl
 |---|---|---|
 | Role | hosts the match + runs the bots | joins the host's match |
 | `COD4_LOCAL_IP` | **its own** VPN IP, e.g. `192.168.2.1` | **its own** VPN IP, `192.168.2.2` |
-| Shared broker folder | same UNC path (read+write) | same UNC path (read+write) |
+| `COD4_MM_PEERS` | the **other** machine's IP (`192.168.2.2`) | the **other** machine's IP (`192.168.2.1`) |
 | Bots | yes (host owns the bots) | no |
 
-The two machines do **NOT** share a filesystem, so the broker registry **must** be a folder both can reach
-over the VPN — an SMB share. Pick one machine (say the host) to share a folder, e.g. `\\192.168.2.1\cod4mm`,
-and map it on the other. Both sides point `COD4_MM_REGISTRY` at that one shared path.
+`COD4_MM_PEERS` is what turns on the network broker — set it to the **other** machine's VPN IP (comma-separate
+if more than one). No shared filesystem, no UNC paths. The broker gossips on **UDP port 31100** by default
+(override with `COD4_MM_BROKER_PORT`, same value on both). You may safely list *both* IPs on both machines if
+that's easier to script — an instance ignores records that came from itself.
 
 ### 7.2 Firewall (both machines)
 
-The title uses raw UDP on the Xbox ports. Open them inbound on **both** machines (Administrator PowerShell):
+The title uses raw UDP on the Xbox ports, plus the broker port. Open them inbound on **both** machines
+(Administrator PowerShell):
 
 ```powershell
 New-NetFirewallRule -DisplayName "cod4mm-udp" -Direction Inbound -Action Allow `
-  -Protocol UDP -LocalPort 59395,62723,59651
+  -Protocol UDP -LocalPort 59395,62723,59651,31100
 ```
 
 (If your VPN exposes its own adapter/profile, make sure the rule applies to it — set `-Profile Any` if unsure.)
@@ -197,8 +201,8 @@ $env:COD4_WPDIR  = "C:\dev\iw3_bot_warfare\scriptdata\waypoints"
 $env:COD4_LIVE         = "1"                    # Xbox LIVE menus (Find Match)
 $env:COD4_PLAYLIST     = "1"                    # populate the Find-Match playlist
 $env:COD4_MMHOST       = "1"                    # host the match (loopback connect-window fix)
-$env:COD4_MM_BROKER    = "1"                    # advertise/aggregate via the file broker
-$env:COD4_MM_REGISTRY  = "\\192.168.2.1\cod4mm" # the SHARED folder (same on both machines)
+$env:COD4_MM_BROKER    = "1"                    # enable the broker (advertise + aggregate)
+$env:COD4_MM_PEERS     = "192.168.2.2"          # the JOINER's IP — turns on the UDP network broker
 $env:COD4_LOCAL_IP     = "192.168.2.1"          # this host's REAL VPN IP
 
 # --- matchmaking join glue (validated set) ---
@@ -221,13 +225,13 @@ $env:COD4_BOTAI      = "1"
 
 ### 7.4 JOINER — launch (your machine, IP `192.168.2.2`)
 
-No bots, no host flags. Same shared registry path, your own IP:
+No bots, no host flags. Point `COD4_MM_PEERS` at the host, use your own IP:
 
 ```powershell
 $env:COD4_LIVE         = "1"
 $env:COD4_PLAYLIST     = "1"
 $env:COD4_MM_BROKER    = "1"
-$env:COD4_MM_REGISTRY  = "\\192.168.2.1\cod4mm"  # the SAME shared folder as the host
+$env:COD4_MM_PEERS     = "192.168.2.1"           # the HOST's IP — turns on the UDP network broker
 $env:COD4_LOCAL_IP     = "192.168.2.2"           # YOUR real VPN IP
 $env:COD4_MM_NOREROUTE = "1"
 $env:COD4_MM_PORT_IDX  = "2"
@@ -239,10 +243,11 @@ $env:COD4_MM_PORT_IDX  = "2"
 
 Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playlist>`.
 
-1. **HOST first.** Let it create the session + start filling bots. Give it ~15–20 s — you want the session
-   file written into the shared folder and a few bots seated before the joiner searches.
-2. **JOINER then** picks the same playlist and presses through Find Match. It discovers the host's session in
-   the registry, shows **"Trying to join potential match"**, and connects to `192.168.2.1:59651` over the VPN.
+1. **HOST first.** Let it create the session + start filling bots. Give it ~15–20 s — the host needs to be
+   gossiping its session and have a few bots seated before the joiner searches.
+2. **JOINER then** picks the same playlist and presses through Find Match. It discovers the host's session
+   (received over UDP from the host), shows **"Trying to join potential match"**, and connects to
+   `192.168.2.1:59651` over the VPN.
 3. The host's match **aborts its own start** (`ARBEMPTY`) so the lobby stays open; the joiner seats. On the
    host you'll briefly see the joiner appear, the arbitration **kick is swallowed** (`NOKICK`), and the
    joiner is **not dropped** (`NODROP`). Joiner advances `connstate 8 → 9` (PRIMED → ACTIVE).
@@ -251,15 +256,19 @@ Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playl
 
 ### 7.6 If it doesn't connect — which half failed
 
-- **Joiner never sees a match** (Find Match stays empty): the broker isn't shared. Check that the host
-  actually wrote a `*.session` file into `COD4_MM_REGISTRY`, and that the joiner can read that exact folder
-  (open the UNC path in Explorer on the joiner). This is the SMB-share half.
-- **Joiner says "joining" then drops / times out**: the UDP didn't traverse the VPN. Confirm the firewall
-  rule on the **host** for inbound UDP `59651`, and that the joiner can reach `192.168.2.1` at all
-  (`Test-NetConnection 192.168.2.1` — note ICMP may be blocked even when UDP works). This is the VPN-reach
-  half.
+- **Joiner never sees a match** (Find Match stays empty): the broker gossip isn't reaching the joiner. Check
+  that each side's `COD4_MM_PEERS` is the **other** machine's IP (not its own), that `COD4_MM_BROKER=1` on
+  both, and that **UDP 31100** is open inbound on both (the firewall rule above). This is the broker-reach hop.
+- **Joiner says "joining" then drops / times out**: the *game* UDP didn't traverse the VPN even though the
+  broker did. Confirm the firewall rule on the **host** for inbound UDP `59651`, and that the joiner can reach
+  `192.168.2.1` at all (`Test-NetConnection 192.168.2.1` — note ICMP may be blocked even when UDP works). This
+  is the game-port hop.
 - **Joiner connects then gets kicked after a few seconds**: the `COD4_MM_NODROP` / `COD4_MM_NOKICK` flags
   aren't set on the **host**. Re-check the host's env block.
+
+> The broker's diagnostic trace still goes to a local `trace.log` under your temp dir (or `COD4_MM_REGISTRY`
+> if you set one — optional, used only for the log now). On the host it should show `PUBLISH(net)` and
+> `NETBROKER: listening udp/31100`; on the joiner, `SEARCH: RETURNED 1 host session(s)`.
 
 ---
 
