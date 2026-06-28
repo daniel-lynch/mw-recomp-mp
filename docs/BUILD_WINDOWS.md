@@ -295,6 +295,36 @@ Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playl
 > udp/31100`, `PUBLISH(net)`, and `NETBROKER: learned peer …`; joiner should show `SEARCH: RETURNED 1 host
 > session(s)`.
 
+### 7.7 Diagnostics — turn on full logging + what to collect
+
+When a join doesn't work, add these to **both** machines' env (they're cheap and off by default), then collect
+the two log files from **each** side:
+
+```powershell
+$env:COD4_MM_NETLOG_DUMP   = "1"        # log every UDP send/recv: src/dst ip:port + hex/ascii of the payload
+$env:COD4_MM_NETLOG_BUDGET = "200000"   # how many packet lines to keep (default 400 is too small)
+$env:COD4_MM_SVPROBE       = "1"        # host only: dump the server client slots (who's CONNECTED/ACTIVE)
+```
+
+Two log files (both under `%TEMP%\cod4_mp_sessions\` on Windows, `/tmp/cod4_mp_sessions/` on Linux):
+
+- **`trace.log`** — the matchmaking state machine: `NETBROKER: learned peer …`, `SEARCH: RETURNED …`,
+  `XSessionCreate … (HOST=1)` vs `GUEST adopt host … host_ina=<ip>:<port> (this is who the joiner will try to
+  connect to)`, `JoinRemote`, arbitration. This tells you **who decided to host vs join, and what IP the
+  joiner aims at.**
+- **`nettrace.log`** — every packet: `PKT SENDTO <ip>:<port> len=… hex=… ascii=…` and `PKT RECVFROM …`. This
+  tells you **whether the joiner's connect packets actually reach the host** (look for the host's real VPN IP
+  on the joiner's `SENDTO` lines, and the joiner's IP on the host's `RECVFROM` lines), and the IW3
+  connectionless commands (`ÿÿÿÿconnect` / `getchallenge`) vs netchannel data.
+
+**The decisive lines for "he won't join me":** on the **joiner**, `GUEST adopt host … host_ina=<ip>` (is `<ip>`
+the host's real VPN IP, or wrongly `127.0.0.x` / the joiner's own?) followed by `PKT SENDTO <that ip>:59651`.
+If the joiner adopts but never `SENDTO`s the host's IP, address resolution is the culprit; if it `SENDTO`s but
+the host's `nettrace.log` shows no matching `RECVFROM`, it's the VPN/firewall on the game port.
+
+To collect on Windows: zip the folder — `Compress-Archive $env:TEMP\cod4_mp_sessions cod4mm-logs.zip` — from
+**both** machines after a join attempt.
+
 ---
 
 ## Notes / known caveats
