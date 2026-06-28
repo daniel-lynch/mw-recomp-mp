@@ -34,18 +34,18 @@ git clone git@github.com:daniel-lynch/mw-recomp-mp.git
 git clone https://github.com/ineedbots/iw3_bot_warfare.git   # Bot Warfare — for the waypoint data (runtime)
 ```
 
-**Important — use the right SDK branch.** cod4_mp depends on SDK-side fakes (Xbox 360 System Link host-start
-+ the Live backend) that live on branch **`testing/five-stability-fixes`** (commit `83af1d5` or later). A
-clean `main` / a plain `0.8.1.29` checkout does NOT have them, and System Link won't start (bots won't
-connect). Check it out:
+**Important — use the right branch on BOTH repos: `feat/matchmaking-broker`.** This branch has everything:
+the Xbox 360 System Link host-start + Live backend fakes (a superset of the older `testing/five-stability-fixes`),
+PLUS the **two-client matchmaking** work (the headline below). A clean `main` / `testing/five-stability-fixes`
+does NOT have the matchmaking. Check it out on BOTH sibling repos:
 
 ```powershell
-cd C:\dev\rexglue-sdk
-git checkout testing/five-stability-fixes      # has the CoD4 System Link + Live xam fakes (>= 83af1d5)
+cd C:\dev\rexglue-sdk    ; git checkout feat/matchmaking-broker
+cd C:\dev\mw-recomp-mp   ; git checkout feat/matchmaking-broker
 ```
 
 (The game records `sdk_version = "0.8.1.29"` in `cod4_mp_manifest.toml`; this branch is that line plus the
-cod4 xam fakes, and is the SDK the committed code was built against.)
+cod4 xam fakes + the matchmaking, and is the SDK the committed code was built against.)
 
 The **Bot Warfare** mod (`iw3_bot_warfare`) is an external clone (not vendored here). The bot GSC itself is
 already committed under `mw-recomp-mp/gsc_inject/` (our adapted copy); we only need the upstream clone for
@@ -147,13 +147,129 @@ After you spawn in, the bots load themselves in one at a time (watch the scorebo
 
 ---
 
+## 7. TWO CLIENTS in one "Xbox Live" match (host + a friend over VPN)
+
+This is the new headline. Two **separate machines** (you + a friend), both on the same VPN, join the **same
+Find-Match game** with bots. One machine is the **HOST**, the other is the **JOINER**. There is no real Xbox
+Live — a small file-based **broker** stands in for the Live matchmaking service: the host advertises its
+session into a shared folder, the joiner discovers it there and connects directly over the VPN.
+
+> **Honesty note (read this):** this path was developed and **validated same-box** using Linux network
+> namespaces to emulate "two real machines with distinct IPs" — two clients + 9 bots in one Team Deathmatch,
+> joiner spawned into first-person and stayed in for 150 s+. The **real two-machine-over-VPN run is the live
+> test you're about to do.** It uses the identical SDK real-IP mode; what's unproven is your VPN's
+> UDP reachability + the shared-folder broker over SMB. If it doesn't connect, the diagnostics at the end
+> tell you which of those two it is.
+
+### 7.1 What each side needs
+
+| | HOST (your friend) | JOINER (you, `192.168.2.2`) |
+|---|---|---|
+| Role | hosts the match + runs the bots | joins the host's match |
+| `COD4_LOCAL_IP` | **its own** VPN IP, e.g. `192.168.2.1` | **its own** VPN IP, `192.168.2.2` |
+| Shared broker folder | same UNC path (read+write) | same UNC path (read+write) |
+| Bots | yes (host owns the bots) | no |
+
+The two machines do **NOT** share a filesystem, so the broker registry **must** be a folder both can reach
+over the VPN — an SMB share. Pick one machine (say the host) to share a folder, e.g. `\\192.168.2.1\cod4mm`,
+and map it on the other. Both sides point `COD4_MM_REGISTRY` at that one shared path.
+
+### 7.2 Firewall (both machines)
+
+The title uses raw UDP on the Xbox ports. Open them inbound on **both** machines (Administrator PowerShell):
+
+```powershell
+New-NetFirewallRule -DisplayName "cod4mm-udp" -Direction Inbound -Action Allow `
+  -Protocol UDP -LocalPort 59395,62723,59651
+```
+
+(If your VPN exposes its own adapter/profile, make sure the rule applies to it — set `-Profile Any` if unsure.)
+
+### 7.3 HOST — launch (your friend's machine, IP `192.168.2.1` here)
+
+Same build + `cod4_mp.toml` as section 6. Set these in the SAME shell, then launch:
+
+```powershell
+$env:COD4_GSCDIR = "C:\dev\mw-recomp-mp\gsc_inject"
+$env:COD4_WPDIR  = "C:\dev\iw3_bot_warfare\scriptdata\waypoints"
+
+# --- be the Live host of a matchmaking game ---
+$env:COD4_LIVE         = "1"                    # Xbox LIVE menus (Find Match)
+$env:COD4_PLAYLIST     = "1"                    # populate the Find-Match playlist
+$env:COD4_MMHOST       = "1"                    # host the match (loopback connect-window fix)
+$env:COD4_MM_BROKER    = "1"                    # advertise/aggregate via the file broker
+$env:COD4_MM_REGISTRY  = "\\192.168.2.1\cod4mm" # the SHARED folder (same on both machines)
+$env:COD4_LOCAL_IP     = "192.168.2.1"          # this host's REAL VPN IP
+
+# --- matchmaking join glue (validated set) ---
+$env:COD4_MM_ARBEMPTY  = "1"   # host aborts its own start so the joiner can seat
+$env:COD4_MM_NOKICK    = "1"   # swallow the endparty/arbitration kick of the joiner
+$env:COD4_MM_NODROP    = "1"   # don't SV_DropClient the joiner once it's in
+$env:COD4_MM_BOTRESERVE= "2"   # leave 2 slots free so the joiner has somewhere to go
+$env:COD4_MM_PORT_IDX  = "2"   # advertise the GAME socket (59651) as the online port
+$env:COD4_MM_NOREROUTE = "1"   # real distinct IPs: do NOT port-reroute (that's a same-box hack)
+
+# --- bots ---
+$env:COD4_MAXCLIENTS = "12"
+$env:COD4_BOTSETTLE  = "120"
+$env:COD4_GSCINJECT  = "1"
+$env:COD4_BOTSPAWN   = "1"
+$env:COD4_BOTAI      = "1"
+
+.\cod4_mp.exe --game_data_root=C:\path\to\cod4\gamedata
+```
+
+### 7.4 JOINER — launch (your machine, IP `192.168.2.2`)
+
+No bots, no host flags. Same shared registry path, your own IP:
+
+```powershell
+$env:COD4_LIVE         = "1"
+$env:COD4_PLAYLIST     = "1"
+$env:COD4_MM_BROKER    = "1"
+$env:COD4_MM_REGISTRY  = "\\192.168.2.1\cod4mm"  # the SAME shared folder as the host
+$env:COD4_LOCAL_IP     = "192.168.2.2"           # YOUR real VPN IP
+$env:COD4_MM_NOREROUTE = "1"
+$env:COD4_MM_PORT_IDX  = "2"
+
+.\cod4_mp.exe --game_data_root=C:\path\to\cod4\gamedata
+```
+
+### 7.5 Drive sequence (real controllers)
+
+Both of you go: `Main menu → Xbox LIVE → (sign in) → Find Match → <playlist>`.
+
+1. **HOST first.** Let it create the session + start filling bots. Give it ~15–20 s — you want the session
+   file written into the shared folder and a few bots seated before the joiner searches.
+2. **JOINER then** picks the same playlist and presses through Find Match. It discovers the host's session in
+   the registry, shows **"Trying to join potential match"**, and connects to `192.168.2.1:59651` over the VPN.
+3. The host's match **aborts its own start** (`ARBEMPTY`) so the lobby stays open; the joiner seats. On the
+   host you'll briefly see the joiner appear, the arbitration **kick is swallowed** (`NOKICK`), and the
+   joiner is **not dropped** (`NODROP`). Joiner advances `connstate 8 → 9` (PRIMED → ACTIVE).
+4. Both press through the team/class menus and spawn in. You should be in **one match together with the
+   bots playing** around you.
+
+### 7.6 If it doesn't connect — which half failed
+
+- **Joiner never sees a match** (Find Match stays empty): the broker isn't shared. Check that the host
+  actually wrote a `*.session` file into `COD4_MM_REGISTRY`, and that the joiner can read that exact folder
+  (open the UNC path in Explorer on the joiner). This is the SMB-share half.
+- **Joiner says "joining" then drops / times out**: the UDP didn't traverse the VPN. Confirm the firewall
+  rule on the **host** for inbound UDP `59651`, and that the joiner can reach `192.168.2.1` at all
+  (`Test-NetConnection 192.168.2.1` — note ICMP may be blocked even when UDP works). This is the VPN-reach
+  half.
+- **Joiner connects then gets kicked after a few seconds**: the `COD4_MM_NODROP` / `COD4_MM_NOKICK` flags
+  aren't set on the **host**. Re-check the host's env block.
+
+---
+
 ## Notes / known caveats
 
 - **High bot counts are a settle-time tradeoff,** not a hard wall: 7 bots are very stable at any settle;
   11 bots need `COD4_BOTSETTLE=240` (each bot's heavy spawn-script must drain before the next is injected).
   If a match crashes during the bot fill, raise `COD4_BOTSETTLE` or lower `COD4_BOTS`.
-- **Two-player / friend-connect is NOT wired yet** — this is single-host + bots over System Link. Connecting
-  a second real client is the next milestone.
+- **Two-player / friend-connect IS now wired** — see section 7 for the two-machine matchmaking test. It was
+  validated same-box (netns-emulated distinct IPs); the real two-machine-over-VPN run is the open live test.
 - Custom Create-a-Class is still rank-gated (greyed) — bots use the 5 default offline classes; player ranking
   / fake-Live unlocks are a planned next step.
 - The bot logic is all behind the `COD4_*` env flags above and is off unless you set them; a plain launch

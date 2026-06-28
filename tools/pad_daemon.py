@@ -40,10 +40,22 @@ def main():
         ui.write(e.EV_ABS, ax, v); ui.syn(); time.sleep(0.12)
         ui.write(e.EV_ABS, ax, 0); ui.syn(); time.sleep(0.35)
 
+    # Startup grace period: DISCARD any input that arrives in the first GRACE seconds. Stale blocked
+    # `printf ... > fifo` writers from a previous run (orphaned, invisible to ps/lsof since a writer
+    # blocked in open() has no fd yet and the redirect isn't in its args) flush their buffered button
+    # presses the instant this daemon opens the fifo — which previously phantom-drove the game into a
+    # bad host/map-load and crashed it. The game isn't taking input during boot anyway, so dropping the
+    # first few seconds is safe and makes the harness robust. Tunable via PAD_GRACE_SEC (default 6).
+    grace = float(os.environ.get("PAD_GRACE_SEC", "6"))
+    start = time.time()
     while True:
         with open(a.fifo) as f:          # reopen each burst (blocks until a writer connects)
             for line in f:
+                discard = (time.time() - start) < grace
                 for tok in line.split():
+                    if discard:
+                        print(f"[pad {product:#06x}] DISCARD(grace) {tok}", flush=True)
+                        continue
                     if tok in ("u", "d", "l", "r"):
                         hat(e.ABS_HAT0Y if tok in ("u", "d") else e.ABS_HAT0X, -1 if tok in ("u", "l") else 1)
                     elif tok in BTN:

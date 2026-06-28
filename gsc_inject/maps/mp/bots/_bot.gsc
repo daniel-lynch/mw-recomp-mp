@@ -944,7 +944,21 @@ addBots_loop()
 	}
 	
 	fillAmount = getdvarint( "bots_manage_fill" );
-	
+
+	// [COD4MP-MMRESERVE] Reserve open slots below sv_maxclients so a join-in-progress NET client (the
+	// matchmaking joiner B) has somewhere to land. Without this, BW fills to maxclients-1 (server full) and
+	// B's re-join is rejected with `partyFull` forever, never reaching the game-connect. bots_mm_reserve =
+	// slots to keep free (default 0 = vanilla BW). Set to 2 for the 2-instance matchmaking test.
+	mmReserve = getdvarint( "bots_mm_reserve" );
+	if ( mmReserve > 0 )
+	{
+		maxC = getdvarint( "sv_maxclients" );
+		if ( maxC > mmReserve + 1 && fillAmount > maxC - mmReserve )
+		{
+			fillAmount = maxC - mmReserve;
+		}
+	}
+
 	players = 0;
 	bots = 0;
 	spec = 0;

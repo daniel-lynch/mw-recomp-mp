@@ -31,6 +31,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -179,9 +180,61 @@ static void cod4_bot_spawn_pump(PPCContext& ctx, uint8_t* base) {
     if (!parallel) break;                            // serial: only the lowest unfinished bot per frame
   }
 }
+// [COD4MP-MMSTART] Migration probe (COD4_MM_STARTTRACE=1): from the per-frame in-match pump sub_822CB3B0,
+// log cl0 connstate (global 0x82435780) + the lobby-countdown flag byte (guest VA 0x84C4703D, the
+// `(cls 0x84C40000)+28664+69` the XSessionStart gate at recomp.18:50384 requires ==0) whenever connstate
+// changes. Written to nettrace.log so it interleaves (append order = timeline) with the SDK packet dump,
+// pinning B's lobby-state transition against what host A sends at match-start. Off by default.
+static void cod4_mm_starttrace(uint8_t* base) {
+  if (!env_on("COD4_MM_STARTTRACE")) return;
+  uint32_t cs = rd32(base, 0x82435780u);
+  uint8_t flag = base[0x84C4703Du];
+  static uint32_t last_cs = 0xFFFFFFFFu;
+  static uint8_t last_flag = 0xFF;
+  if (cs == last_cs && flag == last_flag) return;
+  last_cs = cs; last_flag = flag;
+  const char* d = std::getenv("COD4_MM_REGISTRY");
+  std::string path = std::string(d && d[0] ? d : "/tmp/cod4_mp_sessions") + "/nettrace.log";
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fprintf(f, "[pid %d] STATE connstate=%u startflag=%02x\n", (int)getpid(), cs, flag);
+    std::fclose(f);
+  }
+}
+// [COD4MP-MMSPAWNB] Force-spawn the in-progress JOINER (a /net client, slot != 0) the same way bots are
+// spawned: inject team (mr 16 4 autoassign) + class (mr 16 13) via SV_ExecuteClientCommand. Without this the
+// joiner connects (state>=3) but sits at the in-game lobby "Waiting for other players" forever — never on a
+// team, never spawned in the world — so the server sends it only tiny empty snapshots and it eventually
+// times out. The bot pump deliberately SKIPS /net clients; this handles them. Re-arms if the joiner
+// reconnects (state drops <3). Gated COD4_MM_SPAWNB.
+static void cod4_spawn_joiner(PPCContext& ctx, uint8_t* base) {
+  if (!env_on("COD4_MM_SPAWNB")) return;
+  static int jphase[24] = {0}, jtimer[24] = {0};
+  uint32_t svc = rd32(base, 0x82F82D8Cu);
+  uint32_t mcp = rd32(base, 0x82EE1D78u);
+  int maxc = (mcp > 0x10000u) ? (int)rd32(base, mcp + 12) : 0;
+  if (svc < 0x10000u) return;
+  for (int i = 1; i < maxc && i < 24; i++) {
+    uint32_t clp = svc + (uint32_t)i * 0xA2C08u;
+    uint32_t st = rd32(base, clp + 0), nc = rd32(base, clp + 32);
+    if (st < 3 || nc == 0) { jphase[i] = 0; jtimer[i] = 0; continue; }  // not a connected /net joiner -> reset
+    if (jphase[i] >= 2) continue;                                       // already spawned this joiner
+    if (jphase[i] == 0) {
+      if (++jtimer[i] < 90) continue;                                   // settle ~1.5s after it's connected
+      if (bot_queue_on()) cod4_enqueue_cmd(i, "mr 16 4 autoassign"); else cod4_client_cmd(ctx, base, (uint32_t)i, "mr 16 4 autoassign");
+      jphase[i] = 1; jtimer[i] = 0;
+      std::fprintf(stderr, "[COD4MP-SPAWNB] cl#%d /net joiner team autoassign\n", i); std::fflush(stderr);
+    } else if (jphase[i] == 1 && ++jtimer[i] >= 90) {
+      if (bot_queue_on()) cod4_enqueue_cmd(i, "mr 16 13 offline_class1_mp,0"); else cod4_client_cmd(ctx, base, (uint32_t)i, "mr 16 13 offline_class1_mp,0");
+      jphase[i] = 2;
+      std::fprintf(stderr, "[COD4MP-SPAWNB] cl#%d /net joiner class -> spawn\n", i); std::fflush(stderr);
+    }
+  }
+}
 REX_FUNC(sub_822CB3B0) {
   __imp__sub_822CB3B0(ctx, base);
+  cod4_mm_starttrace(base);          // [COD4MP-MMSTART] lobby-state timeline for the migration probe
   cod4_bot_spawn_pump(ctx, base);   // net-packet loop: best-known spawn point (game-thread ClientThink was worse)
+  cod4_spawn_joiner(ctx, base);     // [COD4MP-MMSPAWNB] force-spawn the /net in-progress joiner like a bot
   static int want = -1, phase = 0;
   if (want < 0) { const char* v = std::getenv("COD4_ADDBOTS"); want = v ? std::atoi(v) : 0; }
   if (want <= 0 || phase >= 3) return;
@@ -210,8 +263,46 @@ REX_FUNC(sub_822CB3B0) {
 // where executing the mr16 menuresponse can't re-enter a live frame's VM state. This is the deferred half of
 // the [COD4MP-BOTQUEUE] fix above (the pump enqueues mid-frame; we execute here). One per frame keeps it
 // serial and lets each bot's heavy onSpawned GSC fully drain before the next. On by default (COD4_BOTQUEUE=0 disables).
+// [COD4MP-MMNODROP] SV_DropClient = sub_822044A0(client_t* drop, char* reason) — it sets the client's state
+// to ZOMBIE(1) (gdb-watchpoint-confirmed: it's the fn that writes svs.clients[slot].state=ZOMBIE). On the
+// in-progress join, A's ARBEMPTY abort-start path calls this (via Cmd_ExecuteSingleCommand) to KICK the
+// joiner B for XBOXLIVE_NOTREGISTEREDWITHARBITRATION ~3s after B loads in (B reaches CA_ACTIVE then A drops
+// its SV slot -> stops snapshots -> B times out). Skip the drop for a /net joiner (slot != 0, netchan@+32
+// != 0) so B stays in the match. clientNum = (client_t* - svs.clients)/0xA2C08; slot 0 = host loopback.
+// Gated COD4_MM_NODROP.
+extern "C" void __imp__sub_822044A0(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_822044A0) {
+  if (env_on("COD4_MM_NODROP")) {
+    uint32_t cl = ctx.r3.u32;
+    uint32_t svc = rd32(base, 0x82F82D8Cu);
+    if (svc > 0x10000u && cl >= svc) {
+      uint32_t slot = (cl - svc) / 0xA2C08u;
+      uint32_t nc = rd32(base, cl + 32u);              // netchan-ish: 0 = bot, != 0 = networked client
+      if (slot != 0 && slot < 18 && nc != 0) {
+        static int n = 0;
+        if (n++ < 10) {
+          std::fprintf(stderr, "[COD4MP-NODROP] blocked SV_DropClient for /net joiner slot %u\n", slot);
+          std::fflush(stderr);
+        }
+        return;                                        // keep B in the match
+      }
+    }
+  }
+  __imp__sub_822044A0(ctx, base);
+}
+
 extern "C" void __imp__sub_82236420(PPCContext& ctx, uint8_t* base);
 REX_FUNC(sub_82236420) {
+  // [COD4MP-NOSVFRAME] EXPERIMENT (joiner B only): the in-progress-join B ends up running its OWN (empty)
+  // server — its main thread sits in SV_Frame (this fn) — while its CLIENT connection to A stalls at
+  // CA_CONNECTED (never CA_PRIMED). Skip B's server frame to test whether the self-hosted server frame
+  // blocks/delays the client gamestate-load. If B's connect breaks (never reaches CA_CONNECTED) the connect
+  // NEEDS the loopback server; if B then reaches PRIMED/ACTIVE the self-host was the blocker. Gated
+  // COD4_MM_NOSVFRAME.
+  if (env_on("COD4_MM_NOSVFRAME")) {
+    static int n = 0; if (n++ < 3) { std::fprintf(stderr, "[COD4MP-NOSVFRAME] skipping joiner SV_Frame\n"); std::fflush(stderr); }
+    return;
+  }
   __imp__sub_82236420(ctx, base);
   if (bot_queue_on()) {
     int h = g_cmdq_head.load(std::memory_order_relaxed);
@@ -288,7 +379,51 @@ REX_FUNC(sub_821AC9A0) {
     ctx.r3.u32 = 1;
     return;
   }
+  // [COD4MP-MMNOHOST] The JOINER must NEVER promote itself to host: on the in-progress re-join B was
+  // wrongly spinning up its OWN local server (SVPROBE fires 450x on B in join-in-progress vs 0x in the
+  // lobby; its main thread runs SV_Frame), so its "Setting up game" is B's local server map-load and its
+  // client connection to A never completes (connstate stuck CA_CONNECTED, never PRIMED/ACTIVE). Force the
+  // host-decision gate to 0 ("no host -> stay a client / join the discovered host") on the joiner. Gated
+  // COD4_MM_NOHOST. Logs each call so we can see if this path is even taken on the re-join.
+  if (env_on("COD4_MM_NOHOST")) {
+    static int n = 0;
+    if (n++ < 20) { std::fprintf(stderr, "[COD4MP-MMNOHOST] sub_821AC9A0 -> 0 (joiner stays client)\n"); std::fflush(stderr); }
+    ctx.r3.u32 = 0;
+    return;
+  }
   __imp__sub_821AC9A0(ctx, base);
+}
+
+// [COD4MP-MMCONNTRACE] Trace the client connect handshake to find why a direct `connect` doesn't advance
+// connstate (0x82435780). Per docs/research/mp-connect-bots-handoff.md: CL_Connect=sub_822CB048 (sets up
+// the connect, calls per-client sub_822C9780 + addr-resolve sub_8222D2D0), and sub_822CAC00 = the
+// challenge resend pump that transmits getchallenge ONLY when connstate==3. Logs entry/exit connstate of
+// CL_Connect + whether the resend pump runs. Gated COD4_MM_CONNTRACE.
+extern "C" void __imp__sub_822CB048(PPCContext& ctx, uint8_t* base);   // CL_Connect
+REX_FUNC(sub_822CB048) {
+  if (env_on("COD4_MM_CONNTRACE")) {
+    uint32_t cs0 = rd32(base, 0x82435780u);
+    std::fprintf(stderr, "[COD4MP-CONNTRACE] CL_Connect ENTER connstate=%u r3=%08X r4=%08X r5=%08X\n",
+                 cs0, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+    std::fflush(stderr);
+    __imp__sub_822CB048(ctx, base);
+    std::fprintf(stderr, "[COD4MP-CONNTRACE] CL_Connect EXIT  connstate=%u\n", rd32(base, 0x82435780u));
+    std::fflush(stderr);
+    return;
+  }
+  __imp__sub_822CB048(ctx, base);
+}
+extern "C" void __imp__sub_822CAC00(PPCContext& ctx, uint8_t* base);   // CL_CheckForResend (challenge pump)
+REX_FUNC(sub_822CAC00) {
+  __imp__sub_822CAC00(ctx, base);
+  if (env_on("COD4_MM_CONNTRACE")) {
+    static int n = 0;
+    if (n++ < 40) {
+      std::fprintf(stderr, "[COD4MP-CONNTRACE] resend-pump sub_822CAC00 ran, connstate=%u\n",
+                   rd32(base, 0x82435780u));
+      std::fflush(stderr);
+    }
+  }
 }
 
 // [COD4MP-FFDUMP] Dump decompressed fastfile zones for offline analysis. The 360 .ff are SIGNED
@@ -338,6 +473,32 @@ REX_FUNC(sub_822B31B0) {
   __imp__sub_822B31B0(ctx, base);
   if (env_on("COD4_MMHOST") && (lr == 0x821E9F88u || lr == 0x821E9FD0u)) {
     ctx.r3.u32 = 0;  // ui_partyFull check sees count 0 -> party not "full" -> no spurious popup
+  }
+}
+
+// [COD4MP-MMLOCALCHECK] Probe/hook the title's "is this address my own loopback/local?" check. The IW3
+// connection SM byte-checks an address against 127.0.0.1 to decide "this is ME / local" and (for a peer)
+// loops "Trying to join" instead of connecting. For DISTINCT-IP two-instance play (A=127.0.0.1,
+// B=127.0.0.2) the joiner B must treat its OWN ip (127.0.0.2) as local and the host A (127.0.0.1) as
+// REMOTE — the opposite of the hardcoded check. PROBE phase (COD4_MM_LOCALCHECK=probe): log in/out so we
+// learn the arg register + return convention. HOOK phase (COD4_MM_LOCALCHECK=<own_ip_hostorder_hex>, e.g.
+// 0200007F for 127.0.0.2): rewrite the result so the instance's OWN ip reads local and 127.0.0.1 does not.
+extern "C" void __imp__sub_822B9598(PPCContext& ctx, uint8_t* base);
+REX_FUNC(sub_822B9598) {
+  const char* mode = std::getenv("COD4_MM_LOCALCHECK");
+  uint32_t in_r3 = ctx.r3.u32, in_r4 = ctx.r4.u32, in_r5 = ctx.r5.u32, in_lr = (uint32_t)ctx.lr;
+  __imp__sub_822B9598(ctx, base);
+  if (mode && mode[0]) {
+    // Only log calls whose args look like a loopback IP (0x7F in either byte order) or a guest pointer to
+    // one, so we catch the self/peer address check and skip boot noise.
+    auto loopy = [](uint32_t v) { return ((v >> 24) & 0xFF) == 0x7F || (v & 0xFF) == 0x7F; };
+    static int budget = 200;
+    if (budget > 0 && (loopy(in_r3) || loopy(in_r4) || loopy(in_r5))) {
+      budget--;
+      std::fprintf(stderr, "[COD4MP-LOCALCHECK] in r3=%08X r4=%08X r5=%08X -> ret r3=%08X lr=%08X\n",
+                   in_r3, in_r4, in_r5, ctx.r3.u32, in_lr);
+      std::fflush(stderr);
+    }
   }
 }
 
@@ -399,6 +560,7 @@ struct RosterEntry { std::string name; uint32_t rank; };
 
 extern "C" void __imp__sub_822367B8(PPCContext& ctx, uint8_t* base);   // Com_Frame
 extern "C" void __imp__sub_82238420(PPCContext& ctx, uint8_t* base);   // Cmd_ExecuteSingleCommand(local, ctrl, text)
+extern "C" void __imp__sub_82207F48(PPCContext& ctx, uint8_t* base);   // start-match handler (r3=1 -> sub_822079D8)
 REX_FUNC(sub_822367B8) {
   if (env_on("COD4_MMHOST")) {
     uint32_t cs = rd32(base, 0x82435780u);          // cl0 connstate
@@ -459,6 +621,193 @@ REX_FUNC(sub_822367B8) {
       }
     }
   }
+  // [COD4MP-MMTEAMDIFF] Direct-poke party_maxTeamDiff (dvar*@0x8243BE34, value int@+0xc, default 1) to a
+  // large value while in the lobby (cs==0): the host's auto-start countdown won't fire when the team
+  // imbalance exceeds party_maxTeamDiff, and a 2-player bot-free lobby (both unassigned/one side) exceeds 1.
+  // Console set didn't take, so poke the value directly (proven approach, like COD4_MAXCLIENTS). Gated
+  // COD4_MM_TEAMDIFF.
+  if (env_on("COD4_MM_TEAMDIFF")) {
+    uint32_t cs = rd32(base, 0x82435780u);
+    if (cs == 0u) {
+      uint32_t mdv = rd32(base, 0x8243BE34u);                       // party_maxTeamDiff dvar*
+      if (mdv >= 0x82000000u && mdv < 0x86000000u) {
+        uint32_t be = __builtin_bswap32(18u);                       // write BE int 18 at value+0xc
+        std::memcpy(base + mdv + 0xcu, &be, 4);
+      }
+      log_once("[COD4MP-MMTEAMDIFF] poking party_maxTeamDiff=18 in lobby");
+    }
+  }
+  // [COD4MP-MMSVPROBE] Log A's SV client slots (state + isReal) ~1x/sec while it's the in-game server, to
+  // see whether the in-progress joiner B is added and at what state it gets stuck/dropped. svs.clients =
+  // *(0x82F82D8C), stride 0xA2C08; client state @+0 (idTech: 0 FREE,1 ZOMBIE,2 CONNECTED,3 PRIMED,4 ACTIVE),
+  // netchan-ish @+32 (0 = bot, !=0 = networked client). Gated COD4_MM_SVPROBE.
+  if (env_on("COD4_MM_SVPROBE")) {
+    static int sv_tick = 0;
+    if ((sv_tick++ % 60) == 0) {
+      uint32_t svc = rd32(base, 0x82F82D8Cu);
+      uint32_t mcp = rd32(base, 0x82EE1D78u);
+      int maxc = (mcp > 0x10000u) ? (int)rd32(base, mcp + 12) : 0;
+      if (svc > 0x10000u && maxc > 0) {
+        char line[256]; int n = std::snprintf(line, sizeof line, "[COD4MP-SVPROBE] clients:");
+        for (int i = 0; i < maxc && i < 18 && n < 230; i++) {
+          uint32_t clp = svc + (uint32_t)i * 0xA2C08u;
+          uint32_t st = rd32(base, clp + 0), nc = rd32(base, clp + 32);
+          if (st != 0) n += std::snprintf(line + n, sizeof line - n, " [%d:st%u%s]", i, st, nc ? "/net" : "/bot");
+        }
+        std::fprintf(stderr, "%s\n", line); std::fflush(stderr);
+      }
+    }
+  }
+  // [COD4MP-MMBOTRESERVE] Tell Bot Warfare to keep N slots OPEN below sv_maxclients so a join-in-progress
+  // NET client (the matchmaking joiner B) has a free slot to land in. Without it, BW fills the server to
+  // maxclients-1 and B's re-join is rejected with `partyFull` forever (never reaching the game-connect).
+  // Sets the `bots_mm_reserve` dvar our _bot.gsc reads (see [COD4MP-MMRESERVE]); execed once the server is
+  // up via Cmd_ExecuteSingleCommand (same path as PARTYDVARS/AUTOCONNECT). Gated COD4_MM_BOTRESERVE=<N>.
+  if (const char* rv = std::getenv("COD4_MM_BOTRESERVE")) {
+    static bool reserve_set = false;
+    if (!reserve_set && rv[0] && rd32(base, 0x82F82D8Cu) > 0x10000u) {  // svs.clients valid = server is up
+      char rcmd[48]; std::snprintf(rcmd, sizeof rcmd, "set bots_mm_reserve %d", std::atoi(rv));
+      // Also stretch the SV client timeouts so a join-in-progress NET client (B) that's slow to cross
+      // PRIMED->ACTIVE isn't dropped with EXE_TIMEDOUT before it spawns. (Diagnostic lever: B reaches
+      // PRIMED + renders the map then A times it out ~6s later; rule out the connect-deadline.)
+      const char* cmds[] = { rcmd, "set sv_timeout 120", "set sv_connectTimeout 120",
+                             "set sv_reconnectlimit 0", "set sv_zombietime 120" };
+      for (const char* c : cmds) {
+        uint32_t va = (ctx.r1.u32 - 0x800u) & ~0xFu;
+        char* d = (char*)(base + va);
+        size_t n = 0; for (; c[n] && n < 0x2F; n++) d[n] = c[n]; d[n] = 0;
+        PPCContext save = ctx;
+        ctx.r3.u32 = 0; ctx.r4.u32 = 0; ctx.r5.u32 = va;
+        __imp__sub_82238420(ctx, base);
+        ctx = save;
+      }
+      reserve_set = true;
+      std::fprintf(stderr, "[COD4MP-MMBOTRESERVE] %s + stretched sv_timeout/connectTimeout (join-in-progress B)\n", rcmd);
+      std::fflush(stderr);
+    }
+  }
+  // [COD4MP-MMPARTYMAX] While the host is in-game, the party still rejects a join-in-progress peer (B) with
+  // `partyFull` even though the SDK session advertises open slots — so the gate is the GAME party layer
+  // (party_maxplayers / member count), not the session. Poke party_maxplayers (dvar*@0x8243BDD8, value int
+  // @+0xc, big-endian) to a large value every frame while the server is up so the host accepts B; also log
+  // the live maxplayers + party member count (array @0x8246C480 stride 0xC0, state@+0) periodically to see
+  // the gate. Gated COD4_MM_BOTRESERVE (same matchmaking-host scenario).
+  if (std::getenv("COD4_MM_BOTRESERVE") && rd32(base, 0x82F82D8Cu) > 0x10000u) {
+    uint32_t mpDvar = rd32(base, 0x8243BDD8u);                       // party_maxplayers dvar*
+    if (mpDvar >= 0x82000000u && mpDvar < 0x86000000u) {
+      uint32_t be = __builtin_bswap32(64u);                          // write BE int 64 at value+0xc
+      std::memcpy(base + mpDvar + 0xcu, &be, 4);
+    }
+    static int pm_tick = 0;
+    if ((pm_tick++ % 120) == 0) {
+      int members = 0;
+      for (int i = 0; i < 18; i++)
+        if (*(base + 0x8246C480u + (uint32_t)i * 0xC0u) != 0) members++;
+      int mpv = (mpDvar >= 0x82000000u && mpDvar < 0x86000000u) ? (int)rd32(base, mpDvar + 0xcu) : -1;
+      std::fprintf(stderr, "[COD4MP-MMPARTYMAX] party_maxplayers=%d partyMembers=%d\n", mpv, members);
+      std::fflush(stderr);
+    }
+  }
+  // [COD4MP-MMDVARSCAN] One-shot: scan the dvar-pointer-global region for party_* dvars and dump each
+  // global addr + name + value bytes. Identifies the dvar globals for direct poking AND verifies whether a
+  // console set took effect. dvar struct: +0 name char*, +0xc value (int/float/bool). Gated COD4_MM_DVARSCAN.
+  if (env_on("COD4_MM_DVARSCAN")) {
+    static int ds_tick = 0;
+    uint32_t cs = rd32(base, 0x82435780u);
+    if ((ds_tick++ % 30) == 0) {                                    // ~2x/sec: track the start countdown
+      auto dval = [&](uint32_t g) -> int {
+        uint32_t dv = rd32(base, g);
+        if (dv < 0x82000000u || dv >= 0x85000000u) return -999;
+        uint32_t nm = rd32(base, dv + 0x00u);                       // validate: dvar.name must be a string ptr
+        if (nm < 0x82000000u || nm >= 0x85000000u) return -999;     // (dvars not registered yet at boot)
+        return (int)rd32(base, dv + 0xcu);
+      };
+      std::fprintf(stderr, "[COD4MP-TIMER] party_timer=%d matchedCount=%d maxplayers=%d host=%d cs=%u\n",
+                   dval(0x8243BE44u), dval(0x8243BDC4u), dval(0x8243BDD8u), dval(0x8243BDC0u), cs);
+      std::fflush(stderr);
+    }
+  }
+  // [COD4MP-MMPARTYDVARS] The host's lobby AUTO-STARTS a match only after `party_minLobbyTime` seconds with
+  // the team imbalance within `party_maxTeamDiff`; the joiner gives up after `party_connectTimeout` (this is
+  // why B leaves ~35s with "Game lobby closed" = menu_xboxlive_lobbyended). Defaults stall a 2-player
+  // bot-free lobby. Override them via the console (Cmd_ExecuteSingleCommand) once at the menu so A auto-
+  // starts fast and B waits long enough to be carried in. Gated COD4_MM_PARTYDVARS.
+  if (env_on("COD4_MM_PARTYDVARS")) {
+    static int pd_tick = 0;
+    uint32_t cs = rd32(base, 0x82435780u);
+    // Re-issue every ~2s while pre-match (cs==0) on BOTH instances: by the time we're in a lobby the party
+    // dvars are registered so the set takes, and re-issuing defeats any reset. minLobbyTime/maxTeamDiff
+    // matter on the HOST (A) auto-start; connectTimeout on the JOINER (B) so it doesn't give up at ~35s.
+    if (cs == 0u && (pd_tick++ % 120) == 0) {
+      static const char* cmds[] = {
+        "party_minLobbyTime 2", "party_maxTeamDiff 18", "party_connectTimeout 600",
+        "party_autoteams 1", "party_minplayers 2",
+      };
+      for (const char* c : cmds) {
+        uint32_t va = (ctx.r1.u32 - 0x800u) & ~0xFu;
+        char* d = (char*)(base + va);
+        size_t n = 0; for (; c[n] && n < 0x7F; n++) d[n] = c[n]; d[n] = 0;
+        PPCContext save = ctx;
+        ctx.r3.u32 = 0; ctx.r4.u32 = 0; ctx.r5.u32 = va;
+        __imp__sub_82238420(ctx, base);
+        ctx = save;
+      }
+      log_once("[COD4MP-MMPARTYDVARS] (re)set party auto-start dvars while hosting lobby");
+    }
+  }
+  // [COD4MP-MMFORCEGO] Force the lobby->match start. With the arbitration fix the host no longer KICKS the
+  // joiner (endparty gone) — but it then takes the "happy path" that waits for a party-ready signal the
+  // joiner never sends, so the "Match beginning in..." countdown shows forever and the match never starts.
+  // `xpartygo` is the party command that launches the match (alongside xstartparty/xpartyveto, found in the
+  // guest string table). We execute it on the HOST via Cmd_ExecuteSingleCommand (same path as AUTOCONNECT)
+  // once >=2 party members are active (A+B both seated), so B is carried into the started match. Gated
+  // COD4_MM_FORCEGO; COD4_MM_FORCEGO_DELAY frames after the 2nd member appears (default 180 ~3s).
+  if (env_on("COD4_MM_FORCEGO")) {
+    static bool went = false;
+    static int settle = 0;
+    if (!went) {
+      uint32_t phDvar = rd32(base, 0x8243BDC0u);                    // party_host dvar*
+      uint8_t host = (phDvar >= 0x82000000u && phDvar < 0x86000000u) ? *(base + phDvar + 0xcu) : 0;
+      uint32_t cs = rd32(base, 0x82435780u);                         // cl0 connstate (0 = lobby)
+      int members = 0;
+      for (int i = 0; i < 18; i++) {
+        uint32_t slot = 0x8246C480u + (uint32_t)i * 0xC0u;
+        if (*(base + slot + 0x00u) == 3) members++;                  // state 3 = active member
+      }
+      if (host == 1 && cs == 0u && members >= 2) {
+        const char* dly = getenv("COD4_MM_FORCEGO_DELAY");
+        int need = dly ? atoi(dly) : 180;
+        if (++settle >= need) {
+          // sub_822079D8 (the start orchestrator) only falls through to Start-Match when the dvar at
+          // *(0x82A9E034) has value byte (+0xc) == 0. Identify it (name @ dvar+0) + log its value, then
+          // (COD4_MM_CLEARGATE=1) clear it so the forced start can proceed. dvar struct: +0 name char*,
+          // +0xc current value.
+          uint32_t gd = rd32(base, 0x82A9E034u);                       // gating dvar*
+          if (gd >= 0x82000000u && gd < 0x86000000u) {
+            uint32_t nameva = rd32(base, gd + 0x00u);
+            const char* nm = (nameva >= 0x10000u && nameva < 0xF0000000u)
+                                 ? reinterpret_cast<const char*>(base + nameva) : "?";
+            uint8_t gval = *(base + gd + 0xcu);
+            std::fprintf(stderr, "[COD4MP-MMFORCEGO] gate dvar='%s' value@+0xc=%u (dvar=%08X)\n",
+                         nm, (unsigned)gval, gd);
+            if (env_on("COD4_MM_CLEARGATE") && gval != 0) {
+              *(base + gd + 0xcu) = 0;                                  // clear the gate
+              std::fprintf(stderr, "[COD4MP-MMFORCEGO] cleared gate dvar -> 0\n");
+            }
+          }
+          // Directly drive the start orchestrator: sub_82207F48 sets r3=1 then tail-calls sub_822079D8.
+          PPCContext save = ctx;
+          __imp__sub_82207F48(ctx, base);
+          ctx = save;
+          went = true;
+          std::fprintf(stderr, "[COD4MP-MMFORCEGO] called start handler sub_82207F48 (members=%d)\n", members);
+          std::fflush(stderr);
+        }
+      } else {
+        settle = 0;
+      }
+    }
+  }
   // [COD4MP-AUTOCONNECT] Second-client / friend-join direct connect (plan B testing toward Live P2P).
   // Fires `connect <ip:port>` once from the main menu via Cmd_ExecuteSingleCommand (sub_82238420; RE:
   // sub-agent 2026-06-26). r3=localClientNum(0), r4=controllerIndex(0), r5=text VA. That call tokenizes
@@ -489,6 +838,21 @@ REX_FUNC(sub_822367B8) {
         }
       } else {
         settle = 0;                                          // left the menu before settling; reset
+      }
+    } else if (did && env_on("COD4_MM_FORCECS")) {
+      // [COD4MP-FORCECS] Bridge experiment (per docs/research/mp-connect-bots-handoff.md TRACK A): after
+      // the direct `connect`, the per-client connstate (0x82435780) stays 0 — CL_Connect runs but the
+      // 0->CA_CONNECTING setter is skipped. ~1.5s post-connect, poke connstate to 3 (CA_CHALLENGING) so the
+      // resend pump (sub_822CAC00) transmits getchallenge to the resolved host. If getchallenge then goes
+      // out (watch nettrace for it to 10.0.0.1) ONLY the state transition is broken (small fix); if not,
+      // CL_Connect didn't resolve/store the address or the transport is also broken. Gated COD4_MM_FORCECS.
+      static int fc = 0; static bool fc_done = false;
+      if (!fc_done && ++fc >= 90) {
+        uint32_t cs = rd32(base, 0x82435780u);
+        std::fprintf(stderr, "[COD4MP-FORCECS] connstate=%u post-connect -> poking 0x82435780 = 3\n", cs);
+        std::fflush(stderr);
+        wr32be(base, 0x82435780u, 3u);
+        fc_done = true;
       }
     }
   }
@@ -1112,6 +1476,24 @@ REX_FUNC(sub_82254EC8) {
   }
 }
 
+
+// [COD4MP-MMSTARTTRACE2] Entry-trace the match-start fns to see WHICH fires when the lobby countdown hits 0
+// (party_timer==0) and from where — the start-decision bail is the lobby->game gate. Budgeted. Gated
+// COD4_MM_STARTTRACE2.
+extern "C" void __imp__sub_822079D8(PPCContext& ctx, uint8_t* base);   // start orchestrator
+extern "C" void __imp__sub_82200598(PPCContext& ctx, uint8_t* base);   // start fn (calls XSessionStart)
+extern "C" void __imp__sub_82202CE8(PPCContext& ctx, uint8_t* base);   // start-match (gametype validate)
+static void st2(const char* nm, PPCContext& ctx) {
+  if (!env_on("COD4_MM_STARTTRACE2")) return;
+  static int budget = 60;
+  if (budget-- <= 0) return;
+  std::fprintf(stderr, "[COD4MP-STARTTRACE2] %s r3=%u r4=%u lr=%08X\n", nm, ctx.r3.u32, ctx.r4.u32,
+               (uint32_t)ctx.lr);
+  std::fflush(stderr);
+}
+REX_FUNC(sub_822079D8) { st2("sub_822079D8(orchestrator)", ctx); __imp__sub_822079D8(ctx, base); }
+REX_FUNC(sub_82200598) { st2("sub_82200598(startfn)", ctx); __imp__sub_82200598(ctx, base); }
+REX_FUNC(sub_82202CE8) { st2("sub_82202CE8(startmatch)", ctx); __imp__sub_82202CE8(ctx, base); }
 
 // [COD4MP-SVPROBE] sub_82205CB8 = SV_ExecuteClientCommand(client_t* cl, char* cmd, int clientOK).
 // Found empirically: the human's Choose-Team -> Auto-Assign sent "mr 16 4 autoassign" through it
