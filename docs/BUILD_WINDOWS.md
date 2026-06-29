@@ -169,6 +169,22 @@ subnet, e.g. a `172.16.x.x` VPN address).
 > one thing only your VPN can confirm is that it passes UDP between you. If it doesn't connect, the
 > diagnostics at the end tell you which hop failed.
 
+> **⚠ REQUIRED: the two machines must have DIFFERENT profile identities.** Both default to the same local
+> profile (`gamertag = "Player"`, `xuid = "B13E07DFF9AB6772"`). The Xbox party can't seat two members with the
+> same XUID, so the joiner's `memberJoin` collapses to `0partyEnding`/`0dis` and the match never forms. Before
+> testing, edit the **joiner's** `profiles.toml` so its `gamertag` and `xuid` differ from the host's:
+>
+> - Linux: `~/.local/share/cod4_mp/profiles/profiles.toml` — Windows: `%LOCALAPPDATA%\cod4_mp\profiles\profiles.toml`
+> ```toml
+> selected_profile = "player"
+> [[profiles]]
+> id = "player"
+> gamertag = "Player2"            # different from the host
+> xuid = "B13E07DFF9AB6773"       # any 16-hex value different from the host's
+> signed_in = true
+> ```
+> No rebuild needed — just restart the joiner after editing.
+
 ### 7.1 What each side needs
 
 | | HOST (you, `192.168.2.2`) | JOINER (your friend, `172.16.x.x`) |
@@ -176,6 +192,7 @@ subnet, e.g. a `172.16.x.x` VPN address).
 | Role | hosts the match + runs the bots | joins the host's match |
 | `COD4_LOCAL_IP` | **its own** VPN IP (`192.168.2.2`) | **its own** VPN IP (`172.16.x.x`) |
 | broker enable | `COD4_MM_NETBROKER=1` (auto-learns the joiner) | `COD4_MM_PEERS=192.168.2.2` (the host's IP) |
+| profile identity | `gamertag`/`xuid` in `profiles.toml` | **MUST differ** from the host (see ⚠ above) |
 | Bots | yes (host owns the bots) | no |
 
 Either `COD4_MM_NETBROKER=1` **or** `COD4_MM_PEERS=<ip[,ip…]>` turns on the network broker. The host uses
