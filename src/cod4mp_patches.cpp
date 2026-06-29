@@ -1150,11 +1150,14 @@ static constexpr uint32_t kStatBlockSize = 16924u;
     uint32_t be = __builtin_bswap32(val);
     std::memcpy(blk + 2004 + (id - 2000) * 4, &be, 4);
   };
-  // [COD4MP-STATS] Blanket challenge-byte seed (0..1999=250) pre-completes challenges — but that makes the
-  // stock challenge code RE-FIRE "Challenge Complete" + its heavy XP/notification path on EVERY kill, which
-  // stalls the server frame (per-kill freeze + net lag, reported in a live match). It's NOT needed for the
-  // headline unlocks (weapons = 3000+ dwords, perks/rank = byte 252, prestige = 2326), so it's OFF by
-  // default. Opt in with COD4_SEED_CHALLENGES=1 to pre-unlock attachments/camos IF you accept the kill spam.
+  // [COD4MP-STATS] PERK / EQUIPMENT unlocks. The Create-a-Class perk list (caller 0x821F49B8) reads byte
+  // stats ~150..267 — these are perk/equipment UNLOCK FLAGS, which a kill never increments, so seeding them
+  // is safe (no per-kill challenge re-fire). (260/261/263/252 are rank flags/level, re-set explicitly below.)
+  for (uint32_t id = 150; id <= 267; ++id) blk[4 + id] = 250;
+  // The FULL byte-stat seed (0..1999) also pre-completes the weapon/combat CHALLENGE counters — but the
+  // stock challenge code then RE-FIRES "Challenge Complete" + its heavy XP/notification path on EVERY kill,
+  // stalling the server frame (per-kill freeze + net lag, user-reported). So it's OPT-IN only: set
+  // COD4_SEED_CHALLENGES=1 to also pre-unlock attachments/camos IF you accept the kill-time spam.
   if (env_on("COD4_SEED_CHALLENGES")) {
     for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;
   }
