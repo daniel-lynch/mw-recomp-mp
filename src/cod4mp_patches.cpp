@@ -1150,7 +1150,14 @@ static constexpr uint32_t kStatBlockSize = 16924u;
     uint32_t be = __builtin_bswap32(val);
     std::memcpy(blk + 2004 + (id - 2000) * 4, &be, 4);
   };
-  for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;       // byte stats: perks/attachments/challenges
+  // [COD4MP-STATS] Blanket challenge-byte seed (0..1999=250) pre-completes challenges — but that makes the
+  // stock challenge code RE-FIRE "Challenge Complete" + its heavy XP/notification path on EVERY kill, which
+  // stalls the server frame (per-kill freeze + net lag, reported in a live match). It's NOT needed for the
+  // headline unlocks (weapons = 3000+ dwords, perks/rank = byte 252, prestige = 2326), so it's OFF by
+  // default. Opt in with COD4_SEED_CHALLENGES=1 to pre-unlock attachments/camos IF you accept the kill spam.
+  if (env_on("COD4_SEED_CHALLENGES")) {
+    for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;
+  }
   blk[4 + 252] = (uint8_t)forcedRank();                            // rank LEVEL (menu display + rank gating)
   blk[4 + 260] = 1; blk[4 + 261] = 1; blk[4 + 263] = 1;           // rank validity flags
   setDword(2301, (uint32_t)forcedRankxp());                       // RANKXP (the XP number)
