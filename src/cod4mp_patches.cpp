@@ -1145,11 +1145,21 @@ static constexpr uint32_t kStatBlockSize = 16924u;
 // high value unlocks rank-and-challenge-gated weapons/perks/attachments; rank byte + flags set last.
 [[maybe_unused]] static void seedStatBlock(uint8_t* base) {
   uint8_t* blk = base + kStatBlock;
-  for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;       // unlock everything (challenge progress)
-  blk[4 + 252] = (uint8_t)forcedRank();                            // rank LEVEL
+  // dword stats live at +2004+(id-2000)*4, guest big-endian (id range 2000..3497).
+  auto setDword = [&](uint32_t id, uint32_t val) {
+    uint32_t be = __builtin_bswap32(val);
+    std::memcpy(blk + 2004 + (id - 2000) * 4, &be, 4);
+  };
+  for (uint32_t id = 0; id < 2000; ++id) blk[4 + id] = 250;       // byte stats: perks/attachments/challenges
+  blk[4 + 252] = (uint8_t)forcedRank();                            // rank LEVEL (menu display + rank gating)
   blk[4 + 260] = 1; blk[4 + 261] = 1; blk[4 + 263] = 1;           // rank validity flags
-  uint32_t be = __builtin_bswap32((uint32_t)forcedRankxp());      // RANKXP dword (guest big-endian)
-  std::memcpy(blk + 2004 + (2301 - 2000) * 4, &be, 4);
+  setDword(2301, (uint32_t)forcedRankxp());                       // RANKXP (the XP number)
+  setDword(2326, (uint32_t)forcedPlevel());                       // PLEVEL = PRESTIGE (was 0 -> showed P0)
+  // [COD4MP-STATS] PRIMARY WEAPON + SIDE ARM unlocks. The Create-a-Class weapon list (caller 0x821F4904)
+  // iterates per-weapon DWORD stats 3000..3497 and locks any that read 0 — the byte-stat seed never
+  // touched the dword range, so all weapons stayed locked even at rank 55 (RE'd via COD4_STATPROBE).
+  // Max them so every weapon (and its challenges) unlocks; confirmed via COD4_FORCEALL[3000,3498)=65535.
+  for (uint32_t id = 3000; id < 3498; ++id) setDword(id, 65535);
 }
 
 // Called from the accessor hook (a convenient per-frame-ish tick): load-or-seed once, then autosave.
