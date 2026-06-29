@@ -1119,7 +1119,7 @@ static std::atomic<int> g_pairCapture{-1};// pair index currently being resolved
 [[maybe_unused]] static int forcedRankxp() {
   // Default must be a valid in-rankTable XP (near max rank). A value far past the table's top
   // threshold makes rankForXp's binary search miss and report rank 0. 65540 ~ CoD4 MP max rank.
-  static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_RANKXP"); v = (s && s[0]) ? std::atoi(s) : 65540; } return v;
+  static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_RANKXP"); v = (s && s[0]) ? std::atoi(s) : 120288; } return v;  // Lv55 threshold (this build's rankTable, via COD4_RANKSCAN); 65540 was only Lv42
 }
 [[maybe_unused]] static int forcedPlevel() {
   static int v = -1; if (v < 0) { const char* s = std::getenv("COD4_PLEVEL"); v = (s && s[0]) ? std::atoi(s) : 10; } return v;
@@ -1203,6 +1203,24 @@ static constexpr uint32_t kStatBlockSize = 16924u;
       std::ifstream f(p, std::ios::binary);
       f.read(reinterpret_cast<char*>(base + kStatBlock), kStatBlockSize);
       std::fprintf(stderr, "[COD4MP-STATS] loaded persisted stats <- %s\n", p.string().c_str());
+      // [COD4MP-STATS] RANKXP migration: the lobby/scoreboard derives level from rankForXp(RANKXP); an old
+      // seed wrote RANKXP=65540 (= Lv42 here). For a maxed profile (rank byte at the seeded max), bump
+      // RANKXP to the real Lv55 threshold (forcedRankxp, found via COD4_RANKSCAN) so the lobby agrees with
+      // Barracks. IN-PLACE (no reseed) so it never wipes saved custom classes.
+      uint8_t* blk0 = base + kStatBlock;
+      if (blk0[4 + 252] >= (uint8_t)forcedRank()) {
+        uint32_t off = 2004 + (2301 - 2000) * 4;  // RANKXP dword (guest big-endian)
+        uint32_t cur = ((uint32_t)blk0[off] << 24) | ((uint32_t)blk0[off + 1] << 16) |
+                       ((uint32_t)blk0[off + 2] << 8) | blk0[off + 3];
+        uint32_t want = (uint32_t)forcedRankxp();
+        if (cur < want) {
+          blk0[off] = (uint8_t)(want >> 24); blk0[off + 1] = (uint8_t)(want >> 16);
+          blk0[off + 2] = (uint8_t)(want >> 8); blk0[off + 3] = (uint8_t)want;
+          saveStatBlock(base);
+          std::fprintf(stderr, "[COD4MP-STATS] migrated RANKXP %u -> %u (lobby shows Lv55)\n",
+                       (unsigned)cur, (unsigned)want);
+        }
+      }
     } else if (env_on("COD4_SEED")) {
       seedStatBlock(base);
       saveStatBlock(base);
@@ -1323,6 +1341,24 @@ extern "C" void __imp__sub_82362DC8(PPCContext& ctx, uint8_t* base);
 REX_FUNC(sub_82362DC8) {
   uint32_t xp = ctx.r3.u32;
   __imp__sub_82362DC8(ctx, base);
+  // [COD4MP-RANKSCAN] one-shot: find the XP threshold for a 0-based target rank in THIS build's rankTable
+  // (the lobby derives level from rankForXp(RANKXP), so the seed's RANKXP must be the real Lv55 XP). Probe
+  // the ORIGINAL fn over increasing XP until output >= target; log the min (the rank's start threshold).
+  if (const char* sc = std::getenv("COD4_RANKSCAN")) {
+    static std::atomic<bool> scanned{false};
+    if (!scanned.exchange(true)) {
+      int want = std::atoi(sc);
+      uint32_t found = 0;
+      for (uint32_t x = 0; x <= 4000000u; x += 32u) {
+        PPCContext probe = ctx; probe.r3.u32 = x;
+        __imp__sub_82362DC8(probe, base);
+        if ((int)probe.r3.u32 >= want) { found = x; break; }
+      }
+      std::fprintf(stderr, "[COD4MP-RANKSCAN] rank %d (Lv%d) threshold XP = %u\n", want, want + 1,
+                   (unsigned)found);
+      std::fflush(stderr);
+    }
+  }
   if (env_on("COD4_STATPROBE")) {
     std::fprintf(stderr, "[COD4MP-STATPROBE] rankForXp(xp=%u) -> rank=%d\n", (unsigned)xp, (int)ctx.r3.u32);
     std::fflush(stderr);
