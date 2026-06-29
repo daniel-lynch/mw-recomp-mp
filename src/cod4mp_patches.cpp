@@ -774,7 +774,12 @@ REX_FUNC(sub_822367B8) {
         uint32_t slot = 0x8246C480u + (uint32_t)i * 0xC0u;
         if (*(base + slot + 0x00u) == 3) members++;                  // state 3 = active member
       }
-      if (host == 1 && cs == 0u && members >= 2) {
+      // [COD4MP-MMHOSTLIVE] member threshold to fire the start: default 2 (carry a joiner), but set
+      // COD4_MM_FORCEGO_MIN=1 to start SOLO — the host goes live with bots by itself (Live Find-Match solo
+      // testing, and the groundwork for first-try join where the host is live before the joiner searches).
+      static int forceGoMin = -1;
+      if (forceGoMin < 0) { const char* m = getenv("COD4_MM_FORCEGO_MIN"); forceGoMin = (m && m[0]) ? atoi(m) : 2; }
+      if (host == 1 && cs == 0u && members >= forceGoMin) {
         const char* dly = getenv("COD4_MM_FORCEGO_DELAY");
         int need = dly ? atoi(dly) : 180;
         if (++settle >= need) {
