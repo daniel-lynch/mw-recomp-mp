@@ -800,12 +800,25 @@ REX_FUNC(sub_822367B8) {
               std::fprintf(stderr, "[COD4MP-MMFORCEGO] cleared gate dvar -> 0\n");
             }
           }
-          // Directly drive the start orchestrator: sub_82207F48 sets r3=1 then tail-calls sub_822079D8.
+          // Drive the match start. Default: the direct start orchestrator (sub_82207F48 -> sub_822079D8).
+          // COD4_MM_FORCEGO_CMD=<cmd> instead issues a party-launch CONSOLE command via
+          // Cmd_ExecuteSingleCommand (sub_82238420; same path as AUTOCONNECT) — e.g. "xpartygo" — which is
+          // the documented party-start command; use this if the direct call doesn't actually spawn the
+          // server (sv_running stays 0).
           PPCContext save = ctx;
-          __imp__sub_82207F48(ctx, base);
+          if (const char* cmd = getenv("COD4_MM_FORCEGO_CMD"); cmd && cmd[0]) {
+            uint32_t va = (ctx.r1.u32 - 0x800u) & ~0xFu;       // guest scratch below current frame
+            char* d = (char*)(base + va);
+            int i = 0; for (; cmd[i] && i < 158; i++) d[i] = cmd[i]; d[i] = 0;
+            ctx.r3.u32 = 0; ctx.r4.u32 = 0; ctx.r5.u32 = va;   // (localClientNum, controllerIndex, text)
+            __imp__sub_82238420(ctx, base);
+            std::fprintf(stderr, "[COD4MP-MMFORCEGO] issued start command '%s' (members=%d)\n", cmd, members);
+          } else {
+            __imp__sub_82207F48(ctx, base);
+            std::fprintf(stderr, "[COD4MP-MMFORCEGO] called start handler sub_82207F48 (members=%d)\n", members);
+          }
           ctx = save;
           went = true;
-          std::fprintf(stderr, "[COD4MP-MMFORCEGO] called start handler sub_82207F48 (members=%d)\n", members);
           std::fflush(stderr);
         }
       } else {
